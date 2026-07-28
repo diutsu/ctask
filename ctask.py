@@ -1317,7 +1317,7 @@ def _find_repo_root(start: Path) -> Path | None:
 # CLI
 # --------------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tasks.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(prog="ctask", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--file", default=None, help="path to TASKS.md (default: <git repo root>/docs/TASKS.md)")
     p.add_argument("--done-file", default=None, help="path to the completed-task ledger (default: <TASKS.md's dir>/DONE.md)")
     sub = p.add_subparsers(dest="cmd", required=True)
