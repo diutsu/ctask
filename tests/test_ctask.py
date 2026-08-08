@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -645,6 +646,139 @@ def test_infer_section_from_module_matches_real_headers():
 def test_infer_section_from_module_falls_back_to_top_level_segment():
     assert tasks._infer_section_from_module("analysis.signals") == "analysis"
     assert tasks._infer_section_from_module("fetcher.reddit") == "fetcher"
+
+
+# --------------------------------------------------------------------------
+# per-project module config: docs/.ctask (JSON) extends/overrides the
+# builtin _MODULE_PREFIX_MAP for one repo, without polluting it globally.
+# --------------------------------------------------------------------------
+def _write_project_config(repo_root: Path, modules: dict) -> Path:
+    docs_dir = repo_root / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    config_path = docs_dir / ".ctask"
+    config_path.write_text(json.dumps({"modules": modules}), encoding="utf-8")
+    return config_path
+
+
+PROJECT_SECTIONS_FIXTURE = """---
+type: requirement
+state: wip
+created: 2026-01-01
+updated: 2026-01-01
+cross-file-references: [docs/TASKS.md]
+---
+# Tasks
+
+## CR wave — 2026-07-01 code review findings
+
+### CR-01 — placeholder cr task
+
+- prio:: low
+- module:: cr
+- created:: 2026-01-01
+
+**Goal.** placeholder.
+
+**Done when.** placeholder.
+
+## Follow-ups — deferred decisions
+
+### FU-01 — placeholder fu task
+
+- prio:: low
+- module:: fu
+- created:: 2026-01-01
+
+**Goal.** placeholder.
+
+**Done when.** placeholder.
+"""
+
+
+def test_infer_prefix_from_module_repo_root_none_matches_default_behavior():
+    # explicit repo_root=None must behave identically to omitting it entirely
+    assert tasks._infer_prefix_from_module("features", None) == tasks._infer_prefix_from_module("features")
+    assert tasks._infer_section_from_module("features", None) == tasks._infer_section_from_module("features")
+
+
+def test_infer_prefix_and_section_from_project_config(tmp_path: Path):
+    _write_project_config(tmp_path, {
+        "cr": {"prefix": "CR", "section": "CR wave — 2026-07-01 code review findings"},
+        "fu": {"prefix": "FU", "section": "Follow-ups — deferred decisions"},
+    })
+    assert tasks._infer_prefix_from_module("cr", repo_root=tmp_path) == "CR"
+    assert tasks._infer_section_from_module("cr", repo_root=tmp_path) == "CR wave — 2026-07-01 code review findings"
+
+
+def test_project_config_overrides_builtin_on_key_collision(tmp_path: Path):
+    _write_project_config(tmp_path, {
+        "features": {"prefix": "ZZZZ", "section": "overridden section"},
+    })
+    assert tasks._infer_prefix_from_module("features", repo_root=tmp_path) == "ZZZZ"
+    assert tasks._infer_section_from_module("features", repo_root=tmp_path) == "overridden section"
+
+
+def test_missing_project_config_file_falls_back_to_builtin_only(tmp_path: Path):
+    (tmp_path / "docs").mkdir()  # docs/ exists, but no .ctask file in it
+    assert tasks._infer_prefix_from_module("features", repo_root=tmp_path) == "FEAT"
+
+
+def test_project_config_missing_docs_dir_falls_back_to_builtin_only(tmp_path: Path):
+    assert tasks._infer_prefix_from_module("features", repo_root=tmp_path) == "FEAT"
+
+
+def test_malformed_project_config_invalid_json_raises_value_error(tmp_path: Path):
+    config_path = tmp_path / "docs" / ".ctask"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        tasks._infer_prefix_from_module("cr", repo_root=tmp_path)
+    assert str(config_path) in str(exc.value)
+
+
+def test_malformed_project_config_bad_prefix_shape_raises_value_error(tmp_path: Path):
+    config_path = _write_project_config(tmp_path, {"cr": {"prefix": "lowercase", "section": "x"}})
+    with pytest.raises(ValueError) as exc:
+        tasks._infer_prefix_from_module("cr", repo_root=tmp_path)
+    assert str(config_path) in str(exc.value)
+
+
+def test_add_end_to_end_with_project_config(tmp_path: Path, done_file, capsys):
+    tasks_path = tmp_path / "docs" / "TASKS.md"
+    tasks_path.parent.mkdir(parents=True)
+    tasks_path.write_text(PROJECT_SECTIONS_FIXTURE, encoding="utf-8")
+    _write_project_config(tmp_path, {
+        "cr": {"prefix": "CR", "section": "CR wave — 2026-07-01 code review findings"},
+        "fu": {"prefix": "FU", "section": "Follow-ups — deferred decisions"},
+    })
+    rc, out, _ = run_captured(
+        capsys, tasks_path, done_file, "add",
+        "--module", "cr", "--title", "New CR task", "--prio", "low",
+        "--goal", "g", "--done-when", "d",
+    )
+    assert rc == 0
+    new_id = out.strip()
+    assert new_id.startswith("CR-")
+    parsed = tasks.parse_tasks_file(tasks_path.read_text(encoding="utf-8"))
+    section = next(s for s in parsed.sections if s.name == "CR wave — 2026-07-01 code review findings")
+    assert new_id in [t.id for t in section.tasks]
+
+
+def test_edit_module_moves_task_under_project_config_section(tmp_path: Path, done_file, capsys):
+    tasks_path = tmp_path / "docs" / "TASKS.md"
+    tasks_path.parent.mkdir(parents=True)
+    tasks_path.write_text(PROJECT_SECTIONS_FIXTURE, encoding="utf-8")
+    _write_project_config(tmp_path, {
+        "cr": {"prefix": "CR", "section": "CR wave — 2026-07-01 code review findings"},
+        "fu": {"prefix": "FU", "section": "Follow-ups — deferred decisions"},
+    })
+    rc, _, _ = run_captured(capsys, tasks_path, done_file, "edit", "FU-01", "--module", "cr")
+    assert rc == 0
+    parsed = tasks.parse_tasks_file(tasks_path.read_text(encoding="utf-8"))
+    cr_section = next(s for s in parsed.sections if s.name == "CR wave — 2026-07-01 code review findings")
+    fu_section = next(s for s in parsed.sections if s.name == "Follow-ups — deferred decisions")
+    assert "FU-01" in [t.id for t in cr_section.tasks]
+    assert "FU-01" not in [t.id for t in fu_section.tasks]
 
 
 def test_add_module_interfaces_cli_lands_under_correct_section_with_cli_id(sections_file, done_file, capsys):

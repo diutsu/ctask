@@ -32,6 +32,11 @@ untouched spans are never re-rendered — so a parse of an unmodified file,
 serialized back out, is byte-identical to the input. If parsing fails for any
 reason, nothing is written.
 
+Per-project module map: an optional `<repo_root>/docs/.ctask` JSON file
+(`{"modules": {"cr": {"prefix": "CR", "section": "..."}}}`) extends and
+overrides the builtin `_MODULE_PREFIX_MAP` for that repo only — the builtin
+map is always the fallback/default. See `_load_project_module_map`.
+
 This script lives in a global skill directory shared by every project, so the
 registry is resolved from the current git repository, not from the script's own
 location: `git rev-parse --show-toplevel` finds the repo root, and the registry
@@ -67,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import re
 import subprocess
@@ -812,7 +818,48 @@ def cmd_refs(parsed: ParsedFile, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # add
 # --------------------------------------------------------------------------
-def _lookup_module_mapping(module: str) -> tuple[str, str]:
+def _load_project_module_map(repo_root: Path | None) -> dict[str, tuple[str, str]]:
+    """Load `<repo_root>/docs/.ctask`'s "modules" map, or {} if `repo_root`
+    is None or the file doesn't exist.
+
+    Config shape: `{"modules": {"cr": {"prefix": "CR", "section": "..."}}}`.
+    Malformed config (bad JSON, missing "modules", a bad entry) raises
+    ValueError naming the file path and what's wrong — never silently
+    ignored or partially applied.
+    """
+    if repo_root is None:
+        return {}
+    config_path = repo_root / "docs" / ".ctask"
+    if not config_path.exists():
+        return {}
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"{config_path}: could not read file ({e})") from e
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{config_path}: invalid JSON ({e})") from e
+    if not isinstance(data, dict) or "modules" not in data:
+        raise ValueError(f"{config_path}: missing required 'modules' key")
+    modules = data["modules"]
+    if not isinstance(modules, dict):
+        raise ValueError(f"{config_path}: 'modules' must be a dict")
+    out: dict[str, tuple[str, str]] = {}
+    for key, entry in modules.items():
+        if not isinstance(entry, dict) or "prefix" not in entry or "section" not in entry:
+            raise ValueError(f"{config_path}: module {key!r} entry must have 'prefix' and 'section'")
+        prefix = entry["prefix"]
+        section = entry["section"]
+        if not isinstance(prefix, str) or not _ID_PREFIX_RE.match(prefix):
+            raise ValueError(f"{config_path}: module {key!r} prefix {prefix!r} must be 2-4 uppercase letters")
+        if not isinstance(section, str) or not section.strip():
+            raise ValueError(f"{config_path}: module {key!r} section must be a non-empty string")
+        out[key] = (prefix, section)
+    return out
+
+
+def _lookup_module_mapping(module: str, repo_root: Path | None = None) -> tuple[str, str]:
     """(id-prefix, default "## <section>" name) for a --module value.
 
     Longest dotted-segment match wins: "interfaces.cli" -> ("CLI",
@@ -822,22 +869,29 @@ def _lookup_module_mapping(module: str) -> tuple[str, str]:
 
     Single lookup backs both `add`'s id-prefix inference and its default
     section placement — they must never be two maps that can drift apart.
+
+    `repo_root`, when given, layers `<repo_root>/docs/.ctask` (project
+    config) over the builtin `_MODULE_PREFIX_MAP` — project config wins on
+    key collision, builtin is the fallback/default. `repo_root=None`
+    (default) preserves exactly the builtin-only behavior.
     """
+    project_map = _load_project_module_map(repo_root)
+    combined = {**_MODULE_PREFIX_MAP, **project_map}
     segments = module.split(".")
     for k in range(len(segments), 0, -1):
         candidate = ".".join(segments[:k])
-        if candidate in _MODULE_PREFIX_MAP:
-            return _MODULE_PREFIX_MAP[candidate]
-    known = ", ".join(f"{m} -> {p}" for m, (p, _s) in sorted(_MODULE_PREFIX_MAP.items()))
+        if candidate in combined:
+            return combined[candidate]
+    known = ", ".join(f"{m} -> {p}" for m, (p, _s) in sorted(combined.items()))
     raise ValueError(f"--module {module!r} doesn't map to a known id prefix; known mappings: {known}")
 
 
-def _infer_prefix_from_module(module: str) -> str:
-    return _lookup_module_mapping(module)[0]
+def _infer_prefix_from_module(module: str, repo_root: Path | None = None) -> str:
+    return _lookup_module_mapping(module, repo_root)[0]
 
 
-def _infer_section_from_module(module: str) -> str:
-    return _lookup_module_mapping(module)[1]
+def _infer_section_from_module(module: str, repo_root: Path | None = None) -> str:
+    return _lookup_module_mapping(module, repo_root)[1]
 
 
 def _next_free_id(prefix: str, used_ids: set[str]) -> str:
@@ -894,7 +948,7 @@ def _render_new_task(
 
 def cmd_add(
     parsed: ParsedFile, done_ids: set[str], history_ids: set[str],
-    args: argparse.Namespace, tasks_path: Path,
+    args: argparse.Namespace, tasks_path: Path, repo_root: Path | None = None,
 ) -> int:
     by_id = parsed.tasks_by_id()
     live_ids = set(by_id.keys())
@@ -926,7 +980,7 @@ def cmd_add(
                 return 2
         else:
             try:
-                prefix = _infer_prefix_from_module(args.module)
+                prefix = _infer_prefix_from_module(args.module, repo_root)
             except ValueError as e:
                 print(f"add: {e}", file=sys.stderr)
                 return 1
@@ -947,7 +1001,7 @@ def cmd_add(
         section_name = args.section
     else:
         try:
-            section_name = _infer_section_from_module(args.module)
+            section_name = _infer_section_from_module(args.module, repo_root)
         except ValueError as e:
             print(f"add: {e}", file=sys.stderr)
             return 1
@@ -994,7 +1048,7 @@ def cmd_add(
 # --------------------------------------------------------------------------
 # edit
 # --------------------------------------------------------------------------
-def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path) -> int:
+def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, repo_root: Path | None = None) -> int:
     by_id = parsed.tasks_by_id()
     t = by_id.get(args.id)
     if t is None:
@@ -1032,7 +1086,7 @@ def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path) -> 
         target_section_name = args.section
     elif args.module:
         try:
-            target_section_name = _infer_section_from_module(args.module)
+            target_section_name = _infer_section_from_module(args.module, repo_root)
         except ValueError as e:
             print(f"edit: {e} (or pass --section explicitly)", file=sys.stderr)
             return 1
@@ -1477,9 +1531,9 @@ def main(argv: list[str] | None = None) -> int:
         history_ids, history_warning = _git_history_ids(repo_root_for_git)
         if history_warning:
             print(f"tasks.py: {history_warning}", file=sys.stderr)
-        return cmd_add(parsed, done_ids, history_ids, args, tasks_path)
+        return cmd_add(parsed, done_ids, history_ids, args, tasks_path, repo_root_for_git)
     if args.cmd == "edit":
-        return cmd_edit(parsed, args, tasks_path)
+        return cmd_edit(parsed, args, tasks_path, repo_root_for_git)
     if args.cmd == "close":
         return cmd_close(parsed, parsed_done, args, tasks_path, done_path, repo_root_for_git)
     if args.cmd == "validate":
