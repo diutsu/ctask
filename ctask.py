@@ -1037,6 +1037,17 @@ def cmd_add(
         )
 
     new_task = _parse_single_task_raw(new_raw, section_name)
+
+    bare = _scan_bare_raw_html(new_task.raw)
+    if bare:
+        offset, token = bare[0]
+        print(
+            f"add: refusing to write — {token!r} renders as raw HTML in CommonMark/Obsidian "
+            f"and vanishes; backtick-quote it (`{token}`)",
+            file=sys.stderr,
+        )
+        return 1
+
     section.tasks.append(new_task)
 
     new_text = parsed.render()
@@ -1155,6 +1166,16 @@ def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, rep
         print(f"edit: refusing to write — edited task id changed ({t.id} -> {edited.id})", file=sys.stderr)
         return 1
 
+    bare = _scan_bare_raw_html(edited.raw)
+    if bare:
+        offset, token = bare[0]
+        print(
+            f"edit: refusing to write — {token!r} renders as raw HTML in CommonMark/Obsidian "
+            f"and vanishes; backtick-quote it (`{token}`)",
+            file=sys.stderr,
+        )
+        return 1
+
     moving = target_section is not None and target_section_name != t.section
     if moving:
         for s in parsed.sections:
@@ -1245,7 +1266,16 @@ def cmd_close(
 # valid open tag ON ITS OWN — no attributes, no closing tag needed — so any
 # CommonMark renderer (Obsidian included) eats it as raw inline HTML and it
 # vanishes from the rendered output. The convention (write-docs skill,
-# "Placeholders in prose") is to backtick-quote such placeholders. Matches
+# "Placeholders in prose") is to backtick-quote such placeholders.
+#
+# `_scan_bare_raw_html`/`_RAW_HTML_RE` are also used by `add`/`edit` (above,
+# despite the later definition here — plain top-level name resolution, fine
+# since the whole module loads before any command dispatches) to REFUSE to
+# write new/edited content containing this pattern, rather than merely warn
+# after the fact. `validate` stays a warning (not a hard error) here because
+# it scans the WHOLE file, including legacy content written before this
+# guard existed — a hard error would brick validate for every registry that
+# predates the rule. Matches
 # open, close, and self-closing shapes; autolinks (`<https://…>`) contain
 # characters a tag name can't, so they never match.
 _RAW_HTML_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*\s*/?>")

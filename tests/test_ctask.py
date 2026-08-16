@@ -1789,6 +1789,41 @@ def test_validate_no_warning_for_backticked_placeholder(tmp_path, done_file, cap
     assert out == ""
 
 
+def test_add_refuses_bare_angle_placeholder_in_goal(tasks_file, done_file, capsys):
+    rc, out, err = run_captured(
+        capsys, tasks_file, done_file, "add",
+        "--id", "FEAT-99", "--title", "New thing", "--prio", "low", "--module", "features",
+        "--goal", "Handle each <ticker> we track.", "--done-when", "d",
+    )
+    assert rc != 0
+    assert "<ticker>" in err
+    assert "backtick" in err
+    # nothing written — file byte-identical to the fixture
+    assert tasks_file.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_add_accepts_backticked_angle_placeholder_in_goal(tasks_file, done_file, capsys):
+    rc, out, _ = run_captured(
+        capsys, tasks_file, done_file, "add",
+        "--id", "FEAT-99", "--title", "New thing", "--prio", "low", "--module", "features",
+        "--goal", "Handle each `<ticker>` we track.", "--done-when", "d",
+    )
+    assert rc == 0
+    assert out.strip() == "FEAT-99"
+
+
+def test_edit_refuses_bare_angle_placeholder_in_goal(tasks_file, done_file, capsys):
+    rc, out, err = run_captured(
+        capsys, tasks_file, done_file, "edit", "FEAT-15",
+        "--append-goal", "Also handle each <ticker> we track.",
+    )
+    assert rc != 0
+    assert "<ticker>" in err
+    assert "backtick" in err
+    # nothing written — file byte-identical to the fixture
+    assert tasks_file.read_text(encoding="utf-8") == FIXTURE
+
+
 def test_scan_bare_raw_html_unit():
     hits = tasks._scan_bare_raw_html("### X-1 — t\n\n**Goal.** a <date> and `<ID>` and </tag> and <br/>\n")
     tokens = [tok for _, tok in hits]
