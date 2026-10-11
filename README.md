@@ -1,65 +1,75 @@
 # ctask
 
-A CLI over a markdown task registry: `<git-root>/docs/TASKS.md` (open tasks)
-and `<git-root>/docs/DONE.md` (completed-task ledger). Lets you ask precise
-questions — what's blocking FEAT-24, which tasks touch a given file — without
-loading the whole file into context, and edit the registry without hand-editing
-markdown.
+A zero-dependency CLI over a markdown task registry: `<git-root>/docs/tasks.md` (open tasks) and `<git-root>/docs/done.md` (completed-task ledger), with automatic fallback to legacy uppercase `docs/TASKS.md` and `docs/DONE.md`.
 
-The registry is resolved via `git rev-parse --show-toplevel` from the current
-directory, not from the script's own location — `--file` / `--done-file`
-override this.
+Lets an agent or human query and mutate the task backlog — what is blocking `FEAT-24`, which tasks touch a given file — without loading the entire markdown file into context or risking hand-edit corruption.
 
-## Subcommands
+The registry is resolved via `git rev-parse --show-toplevel` from the current working directory (`--file` and `--done-file` override this). Runs natively on **Linux, macOS, and Windows**.
 
-- `list [--prio P] [--module M] [--blocked] [--unblocked] [--ids-only]` — list open tasks, optionally filtered.
-- `show ID [ID ...]` — print one or more tasks verbatim (falls back to DONE.md, marked `[CLOSED — from DONE.md]`).
-- `search TEXT [--field goal|details|done|title|all] [--ids-only] [--include-done]` — find tasks whose text matches, with a snippet.
-- `blockers ID` — list the tasks that block ID.
-- `blocking ID` — list the tasks that ID blocks.
-- `refs [--referencing PATH] [ID]` — show a task's refs, or which tasks reference a path.
-- `add --title T --prio P --module M ...` — append a new task (id auto-assigned or explicit).
-- `edit ID [--title T] [--prio P] [--module M] ...` — rewrite only the named pieces of one task in place.
-- `close ID` — move a task's span from TASKS.md into DONE.md.
-- `validate` — check structural invariants (required fields, dangling `blocked-by`, duplicate ids, etc.).
+---
 
-Run `ctask.py <subcommand> --help` for full flag lists.
+## Install & Run (`uvx` / `uv`)
 
-## Install
+Zero runtime dependencies (Python $\ge 3.9$ stdlib only):
 
-Zero runtime dependencies — the script is stdlib-only, so the primary route
-is just putting it on `PATH`:
+```bash
+# 1. Run directly from Git via uvx (no install required)
+uvx --from git+https://github.com/diutsu/ctask ctask list
 
-```
+# 2. Install globally onto PATH (Windows, macOS, Linux)
+uv tool install git+https://github.com/diutsu/ctask
+ctask list
+
+# 3. Run or install from a local clone
+uvx --from /path/to/ctask ctask validate
+uv tool install /path/to/ctask
+
+# 4. Editable pip install or direct symlink (POSIX)
+pip install -e .
 ln -s /path/to/ctask/ctask.py ~/.local/bin/ctask
 ```
 
-Alternatively, install it as a package (adds a `ctask` console-script entry
-point):
+---
 
-```
-pip install -e .
-```
+## Subcommands
+
+- `ctask list [--prio P] [--module M] [--blocked] [--unblocked] [--ids-only]` — list open tasks, optionally filtered.
+- `ctask show ID [ID ...]` — print one or more tasks verbatim (falls back to `done.md` / `DONE.md`, marked `[CLOSED — from DONE.md]`).
+- `ctask search TEXT [--field goal|details|done|title|all] [--ids-only] [--include-done]` — find tasks whose text matches, with a snippet.
+- `ctask blockers ID` — list the tasks that block `ID`.
+- `ctask blocking ID` — list the tasks that `ID` blocks.
+- `ctask refs [--referencing PATH] [ID]` — show a task's `refs::`, or which tasks reference `PATH` (normalizes `/` and `\` on Windows).
+- `ctask add --title T --prio P --module M [--id ID | --id-prefix PREFIX] [--section S] [--blocked-by X] [--refs R] [--goal G] [--details D] [--done-when W]` — append a new task (ID auto-assigned from `tasks.md` $\cup$ `done.md` $\cup$ `git log` history).
+- `ctask edit ID [--title T] [--prio P] [--module M] [--section S] [--blocked-by X | --clear-blocked-by] [--refs R | --clear-refs] [--goal G | --append-goal T] [--details D | --append-details T] [--done-when W | --append-done-when T]` — rewrite only the named pieces of one task in place and stamp `edited:: YYYY-MM-DD`.
+- `ctask close ID` — move a task's span from `tasks.md` into `done.md` (stamping `completed::` and `commits::`).
+- `ctask renumber OLD_ID NEW_ID` — rename an open task's ID in place and rewrite every other open task's `blocked-by::` reference to it.
+- `ctask add-section "<name>" --after "<existing-section-name>"` — create a new empty `## <name>` section.
+- `ctask remove-section "<name>"` — delete an empty `## <name>` section header (refuses if it still has tasks).
+- `ctask validate` — check structural invariants (required fields, ISO dates, dangling `blocked-by`, duplicate IDs, bare `<placeholder>` HTML hazards, and code fences).
+
+Run `ctask <subcommand> --help` for full flag lists.
+
+---
 
 ## Tests
 
-```
+```bash
+# Linux / macOS / WSL
 python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest tests/ -q
+
+# Windows (PowerShell)
+python -m pytest tests/test_ctask.py -q
 ```
 
-(Or just `.venv/bin/pip install -q pytest` instead of the editable install —
-the tests load `ctask.py` directly via `importlib`, not via the installed
-package.)
+---
 
-A working `git` binary is required: several tests build throwaway git repos.
-
-## Registry file format
+## Registry File Format (`docs/tasks.md` & `docs/done.md`)
 
 Each open task is an H3 span under an H2 module-section header:
 
-```
+```markdown
 ## <section>
 
 ### <ID> — <title>
@@ -68,7 +78,7 @@ Each open task is an H3 span under an H2 module-section header:
 - module:: interfaces.scheduler
 - created:: 2026-07-15
 - blocked-by:: SCH-12
-- refs:: docs/some-doc.md, src/some/file.py
+- refs:: docs/requirements/scheduler.md, src/storage/db/replica.py
 
 **Goal.** ...
 
@@ -78,14 +88,7 @@ Each open task is an H3 span under an H2 module-section header:
 **Done when.** ...
 ```
 
-`- key:: value` metadata bullets: `prio::`, `module::`, and `created::` are
-required; `blocked-by::` and `refs::` are optional; unknown extra keys are
-preserved. The prose sections are `**Goal.**`, `**Details.**` (optional), and
-`**Done when.**`.
-
-Byte-identical round-tripping of every untouched task span — parse the file,
-serialize it back out unmodified, get the same bytes — is the load-bearing
-invariant. `close` moves a span (verbatim, plus two appended metadata
-bullets) into DONE.md; `add` appends a new span; `edit` rewrites only the
-pieces named by its flags and refuses to write if the result doesn't
-round-trip or would alter any other task's bytes.
+- **Metadata bullets (`- key:: value`):** `prio::`, `module::`, and `created::` are required; `blocked-by::` and `refs::` are optional; unknown extra keys are preserved.
+- **Prose sections:** `**Goal.**`, `**Details.**` (optional), and `**Done when.**`.
+- **Per-project module map (`docs/.ctask`):** Optional JSON file `{"modules": {"<mod>": {"prefix": "<PFX>", "section": "<section-name>"}}}` that extends/overrides the built-in module-to-prefix map for that repository.
+- **Byte-identical round-tripping:** Every untouched task span is preserved verbatim with LF (`\n`) line endings across all platforms.

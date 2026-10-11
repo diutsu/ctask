@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Helper CLI for reading / listing / searching / writing tasks in `docs/TASKS.md`.
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""Helper CLI for reading / listing / searching / writing tasks in `docs/tasks.md` (or `docs/TASKS.md`).
 
-`docs/TASKS.md` (v2 format — see docs/plan-tasks-format-v2 spec) holds every open
+`docs/tasks.md` (v2 format — see docs/plan-tasks-format-v2 spec) holds every open
 task as an H3 entry under a `## <module>` section:
 
     ### SCH-17 — mimir disk pressure blocks the queue model
@@ -27,7 +31,7 @@ context.
 Round-trip safety is the load-bearing property: the file lives under a gitignored
 Obsidian vault symlink, so a bad write is unrecoverable. Parsing keeps every task
 as a verbatim raw span of the source text; `close` moves a span (verbatim, plus
-two appended metadata bullets) into `docs/DONE.md`, `add` appends a new span, and
+two appended metadata bullets) into `docs/done.md`, `add` appends a new span, and
 untouched spans are never re-rendered — so a parse of an unmodified file,
 serialized back out, is byte-identical to the input. If parsing fails for any
 reason, nothing is written.
@@ -40,33 +44,40 @@ map is always the fallback/default. See `_load_project_module_map`.
 This script lives in a global skill directory shared by every project, so the
 registry is resolved from the current git repository, not from the script's own
 location: `git rev-parse --show-toplevel` finds the repo root, and the registry
-is `<root>/docs/TASKS.md` (done ledger: `<root>/docs/DONE.md`). Use `--file` /
-`--done-file` to override (mainly for tests).
+is `<root>/docs/tasks.md` (done ledger: `<root>/docs/done.md`, with fallback to
+`TASKS.md` / `DONE.md`). Use `--file` / `--done-file` to override (mainly for tests).
 
 Usage:
-    tasks.py list [--prio P] [--module M] [--blocked] [--unblocked] [--ids-only]
-    tasks.py show ID [ID ...]
-        (falls back to docs/DONE.md for any id not open in TASKS.md, marking
+    ctask list [--prio P] [--module M] [--blocked] [--unblocked] [--ids-only]
+    ctask show ID [ID ...]
+        (falls back to docs/done.md for any id not open in tasks.md, marking
         the entry "[CLOSED — from DONE.md]"; only genuinely absent from both
         is reported as unknown)
-    tasks.py search TEXT [--field goal|details|done|title|all] [--ids-only]
-        [--include-done]  (also search docs/DONE.md; archived hits are
+    ctask search TEXT [--field goal|details|done|title|all] [--ids-only]
+        [--include-done]  (also search docs/done.md; archived hits are
         labelled "[CLOSED]" so they're never mistaken for open work)
-    tasks.py blockers ID
-    tasks.py blocking ID
-    tasks.py refs [--referencing PATH] [ID]
-    tasks.py add --id ID | --id-prefix PREFIX | (nothing, inferred from --module)
+    ctask blockers ID
+    ctask blocking ID
+    ctask refs [--referencing PATH] [ID]
+    ctask add --id ID | --id-prefix PREFIX | (nothing, inferred from --module)
         --title T --prio P --module M [--section "## name" override, else inferred from --module]
         [--blocked-by X] [--refs R] [--goal G] [--details D] [--done-when W]
         [--goal-file F] [--details-file F] [--done-when-file F] [--stdin]
-    tasks.py edit ID [--title T] [--prio P]
+    ctask edit ID [--title T] [--prio P]
         [--module M] [--section "## name"]      (either one moves the task's span)
         [--blocked-by X | --clear-blocked-by] [--refs R | --clear-refs]
         [--goal G | --goal-file F | --append-goal T]
         [--details D | --details-file F | --append-details T]
         [--done-when W | --done-when-file F | --append-done-when T]
-    tasks.py close ID
-    tasks.py validate
+    ctask close ID
+    ctask renumber OLD_ID NEW_ID
+        (renames an open task's own id in place; also rewrites every other
+        open task's blocked-by:: reference to it. refs:: bullets and prose
+        mentions of the old id are NOT touched — out of scope)
+    ctask add-section "<name>" --after "<existing-section-name>"
+    ctask remove-section "<name>"
+        (refuses unless the section currently has zero tasks)
+    ctask validate
 """
 from __future__ import annotations
 
@@ -77,6 +88,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -254,6 +266,8 @@ def _parse_task_block(lines: list[str], start_idx: int, end_idx: int, section_na
 
 
 def parse_tasks_file(text: str) -> ParsedFile:
+    if "\r\n" in text:
+        text = text.replace("\r\n", "\n")
     lines = text.splitlines(keepends=True)
     n = len(lines)
     i = 0
@@ -344,17 +358,17 @@ def _bump_updated(frontmatter_raw: str, today: str) -> str:
 # --------------------------------------------------------------------------
 # docs/DONE.md — the completed-task ledger `close` moves tasks into.
 # --------------------------------------------------------------------------
-def _default_done_text(today: str) -> str:
+def _default_done_text(today: str, tasks_filename: str = "TASKS.md") -> str:
     return (
         "---\n"
         "type: requirement\n"
         "state: done\n"
         f"created: {today}\n"
         f"updated: {today}\n"
-        "cross-file-references: [docs/TASKS.md]\n"
+        f"cross-file-references: [docs/{tasks_filename}]\n"
         "---\n"
         "# Done\n"
-        "Ledger of completed tasks, moved out of docs/TASKS.md on close. Never reuse a listed id.\n"
+        f"Ledger of completed tasks, moved out of docs/{tasks_filename} on close. Never reuse a listed id.\n"
         "\n"
     )
 
@@ -579,7 +593,7 @@ def _git_history_ids(repo_root: Path) -> tuple[set[str], str | None]:
     try:
         result = subprocess.run(
             ["git", "log", "--all", "--format=%s"],
-            cwd=repo_root, capture_output=True, text=True, timeout=30,
+            cwd=repo_root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return set(), f"could not read git history ({e}) — auto-assigned/explicit ids may collide with a retired one"
@@ -607,7 +621,7 @@ def _find_commits_for_id(task_id: str, repo_root: Path) -> str:
     try:
         result = subprocess.run(
             ["git", "log", "--oneline", "--all", "--grep", task_id, "-i"],
-            cwd=repo_root, capture_output=True, text=True, timeout=15,
+            cwd=repo_root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
         return "(none found)"
@@ -624,8 +638,20 @@ def _find_commits_for_id(task_id: str, repo_root: Path) -> str:
 # --------------------------------------------------------------------------
 def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    for attempt in range(4):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 3:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.025 * (attempt + 1))
 
 
 def _load(path: Path) -> tuple[str, ParsedFile]:
@@ -796,9 +822,9 @@ def cmd_blocking(parsed: ParsedFile, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 def cmd_refs(parsed: ParsedFile, args: argparse.Namespace) -> int:
     if args.referencing:
-        needle = args.referencing.lower()
+        needle = args.referencing.lower().replace("\\", "/")
         for t in parsed.all_tasks():
-            if t.refs and needle in t.refs.lower():
+            if t.refs and needle in t.refs.lower().replace("\\", "/"):
                 print(f"{t.id}  {t.title}")
         return 0
 
@@ -1057,6 +1083,115 @@ def cmd_add(
 
 
 # --------------------------------------------------------------------------
+# add-section / remove-section — `add`/`edit` refuse to place a task under a
+# '## <section>' header that doesn't exist yet; these close that gap (and its
+# inverse) directly.
+# --------------------------------------------------------------------------
+def cmd_add_section(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path) -> int:
+    name = args.name
+    if any(s.name == name for s in parsed.sections):
+        print(f"add-section: '## {name}' already exists in {tasks_path}", file=sys.stderr)
+        return 1
+
+    after_idx = next((k for k, s in enumerate(parsed.sections) if s.name == args.after), None)
+    if after_idx is None:
+        available = ", ".join(s.name for s in parsed.sections)
+        print(f"add-section: no '## {args.after}' section in {tasks_path} (available: {available})", file=sys.stderr)
+        return 1
+
+    other_raws = {t.id: t.raw for t in parsed.all_tasks()}
+
+    new_section = Section(header_raw=f"## {name}\n", name=name, preamble_raw="\n", tasks=[])
+    parsed.sections.insert(after_idx + 1, new_section)
+
+    new_text = parsed.render()
+    try:
+        reparsed = parse_tasks_file(new_text)
+    except TasksParseError as e:
+        print(f"add-section: refusing to write — file no longer parses: {e}", file=sys.stderr)
+        return 1
+    if reparsed.render() != new_text:
+        print("add-section: refusing to write — file does not round-trip", file=sys.stderr)
+        return 1
+    re_raws = {t.id: t.raw for t in reparsed.all_tasks()}
+    for tid, raw in other_raws.items():
+        if re_raws.get(tid) != raw:
+            print(f"add-section: refusing to write — would alter untouched task {tid}", file=sys.stderr)
+            return 1
+
+    _atomic_write(tasks_path, new_text)
+    print(name)
+    return 0
+
+
+def cmd_remove_section(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path) -> int:
+    name = args.name
+    idx = next((k for k, s in enumerate(parsed.sections) if s.name == name), None)
+    if idx is None:
+        available = ", ".join(s.name for s in parsed.sections)
+        print(f"remove-section: no '## {name}' section in {tasks_path} (available: {available})", file=sys.stderr)
+        return 1
+
+    section = parsed.sections[idx]
+    if section.tasks:
+        print(
+            f"remove-section: '## {name}' still has {len(section.tasks)} task(s) — move them out before removing it",
+            file=sys.stderr,
+        )
+        return 1
+
+    other_raws = {t.id: t.raw for t in parsed.all_tasks()}
+
+    # The last task of the section immediately before the one being removed
+    # (if any) owns the trailing blank-line bytes at the seam — a trailing
+    # run of blanks before a "## " header is absorbed into the preceding
+    # task's own raw span, not into any section preamble. If the collapse
+    # below fires, trimming that run is a deliberate, in-scope effect of this
+    # removal on that one task, not a "would alter untouched task" collision.
+    trimmed_task_id: str | None = None
+    if idx > 0 and parsed.sections[idx - 1].tasks:
+        trimmed_task_id = parsed.sections[idx - 1].tasks[-1].id
+
+    before_text = parsed.frontmatter_raw + parsed.preamble_raw + "".join(s.render() for s in parsed.sections[:idx])
+    after_text = "".join(s.render() for s in parsed.sections[idx + 1:])
+
+    # Collapse a blank-line run left at the seam by the removed header+preamble
+    # down to exactly one blank line. Scoped to only the outer edges of these
+    # two already-rendered blocks — it can never reach past the seam into the
+    # rest of either task's content, so a blank-line run that legitimately
+    # lives inside a task body elsewhere in the file is never touched.
+    trailing_nl = len(before_text) - len(before_text.rstrip("\n"))
+    leading_nl = len(after_text) - len(after_text.lstrip("\n"))
+    collapsed = trailing_nl + leading_nl > 2
+    if collapsed:
+        before_text = before_text.rstrip("\n") + "\n\n"
+        after_text = after_text.lstrip("\n")
+
+    new_text = before_text + after_text
+
+    try:
+        reparsed = parse_tasks_file(new_text)
+    except TasksParseError as e:
+        print(f"remove-section: refusing to write — file no longer parses: {e}", file=sys.stderr)
+        return 1
+    if reparsed.render() != new_text:
+        print("remove-section: refusing to write — file does not round-trip", file=sys.stderr)
+        return 1
+    re_raws = {t.id: t.raw for t in reparsed.all_tasks()}
+    for tid, raw in other_raws.items():
+        if collapsed and tid == trimmed_task_id:
+            continue
+        if re_raws.get(tid) != raw:
+            print(f"remove-section: refusing to write — would alter untouched task {tid}", file=sys.stderr)
+            return 1
+
+    parsed.sections = parsed.sections[:idx] + parsed.sections[idx + 1:]
+    _atomic_write(tasks_path, new_text)
+    print(name)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # edit
 # --------------------------------------------------------------------------
 def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, repo_root: Path | None = None) -> int:
@@ -1211,6 +1346,116 @@ def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, rep
 
     _atomic_write(tasks_path, new_text)
     print(t.id)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# renumber — `edit` explicitly refuses to change a task's own id (see the
+# "edited task id changed" guard above); that guard is correct for `edit`.
+# This is the deliberate, narrower operation for the one legitimate case of
+# renaming a task's id in place, including rewriting every OTHER open task's
+# `blocked-by::` reference to it. It does NOT touch `refs::` bullets or any
+# id mention in prose (Goal/Details/Done when) — those are out of scope.
+# --------------------------------------------------------------------------
+def cmd_renumber(
+    parsed: ParsedFile, done_ids: set[str], history_ids: set[str],
+    args: argparse.Namespace, tasks_path: Path,
+) -> int:
+    old_id = args.old_id
+    new_id = args.new_id
+
+    by_id = parsed.tasks_by_id()
+    t = by_id.get(old_id)
+    if t is None:
+        if old_id in done_ids:
+            print(f"renumber: {old_id} is closed (see docs/DONE.md) — cannot renumber a closed task", file=sys.stderr)
+        else:
+            print(f"renumber: unknown id: {old_id}", file=sys.stderr)
+        return 1
+
+    if not _ID_RE.match(new_id):
+        print(f"renumber: {new_id!r} is not a valid task id (expect e.g. FEAT-15)", file=sys.stderr)
+        return 2
+
+    live_ids = set(by_id.keys())
+    retired_ids = done_ids | history_ids  # closed-through-script + ever used in git history
+    if new_id in live_ids:
+        print(f"renumber: refuses to reuse live id {new_id}", file=sys.stderr)
+        return 1
+    if new_id in done_ids:
+        print(f"renumber: refuses to reuse closed id {new_id} (see docs/DONE.md)", file=sys.stderr)
+        return 1
+    if new_id in history_ids:
+        print(f"renumber: refuses to reuse retired id {new_id} (found in git commit history)", file=sys.stderr)
+        return 1
+
+    other_raws = {tid: task.raw for tid, task in by_id.items() if tid != old_id}
+    today = _dt.date.today().isoformat()
+
+    # rewrite the task's own header line, then stamp the audit bullet
+    lines = t.raw.splitlines(keepends=True)
+    nl = "\n" if lines[0].endswith("\n") else ""
+    lines[0] = f"### {new_id} — {t.title}{nl}"
+    new_own_raw = _set_bullet("".join(lines), "edited", today)
+    try:
+        edited_own = _parse_single_task_raw(new_own_raw, t.section)
+    except TasksParseError as e:
+        print(f"renumber: refusing to write — renamed task no longer parses: {e}", file=sys.stderr)
+        return 1
+    if edited_own.id != new_id:
+        print(f"renumber: refusing to write — renamed task id did not come out as {new_id}", file=sys.stderr)
+        return 1
+
+    # rewrite blocked-by:: on every OTHER open task that names old_id as a
+    # whole token (never a substring match — \b is safe here since every id
+    # is letters/digits/hyphen and a hyphen is a non-word character)
+    id_token_re = re.compile(rf"\b{re.escape(old_id)}\b")
+    touched_other_ids: set[str] = set()
+    try:
+        for s in parsed.sections:
+            for i, task in enumerate(s.tasks):
+                if task.id == old_id:
+                    continue
+                bb = task.blocked_by
+                if bb is None or not id_token_re.search(bb):
+                    continue
+                new_bb = id_token_re.sub(new_id, bb)
+                new_task_raw = _set_bullet(task.raw, "blocked-by", new_bb)
+                new_task_raw = _set_bullet(new_task_raw, "edited", today)
+                s.tasks[i] = _parse_single_task_raw(new_task_raw, task.section)
+                touched_other_ids.add(task.id)
+    except TasksParseError as e:
+        print(f"renumber: refusing to write — updated blocked-by no longer parses: {e}", file=sys.stderr)
+        return 1
+
+    for s in parsed.sections:
+        for i, task in enumerate(s.tasks):
+            if task.id == old_id:
+                s.tasks[i] = edited_own
+                break
+
+    # final whole-file guard: must re-parse, must round-trip, and every task
+    # NOT touched by this operation must have byte-identical raw — else
+    # write nothing
+    new_text = parsed.render()
+    try:
+        reparsed = parse_tasks_file(new_text)
+    except TasksParseError as e:
+        print(f"renumber: refusing to write — edited file no longer parses: {e}", file=sys.stderr)
+        return 1
+    if reparsed.render() != new_text:
+        print("renumber: refusing to write — edited file does not round-trip", file=sys.stderr)
+        return 1
+    re_raws = {task.id: task.raw for task in reparsed.all_tasks()}
+    for tid, raw in other_raws.items():
+        if tid in touched_other_ids:
+            continue
+        if re_raws.get(tid) != raw:
+            print(f"renumber: refusing to write — would alter untouched task {tid}", file=sys.stderr)
+            return 1
+
+    _atomic_write(tasks_path, new_text)
+    print(f"{old_id} -> {new_id}")
     return 0
 
 
@@ -1387,7 +1632,7 @@ def _find_repo_root(start: Path) -> Path | None:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            cwd=start, capture_output=True, text=True, timeout=10,
+            cwd=start, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1395,6 +1640,17 @@ def _find_repo_root(start: Path) -> Path | None:
         return None
     out = result.stdout.strip()
     return Path(out) if out else None
+
+
+def _ensure_utf8_stdio() -> None:
+    """Reconfigure Windows console/pipe streams (default cp1252) to UTF-8 so em-dashes never raise UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        enc = getattr(stream, "encoding", None)
+        if enc and enc.lower().replace("-", "") != "utf8" and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -1490,12 +1746,34 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("close")
     sp.add_argument("id")
 
+    sp = sub.add_parser(
+        "renumber",
+        description=(
+            "Rename an open task's own id in place — the one thing `edit` refuses to do. "
+            "Also rewrites every other open task's blocked-by:: reference to the old id. "
+            "refs:: bullets and prose mentions (Goal/Details/Done when) are NOT touched."
+        ),
+    )
+    sp.add_argument("old_id")
+    sp.add_argument("new_id")
+
+    sp = sub.add_parser("add-section", description="Create a new empty '## <name>' section.")
+    sp.add_argument("name")
+    sp.add_argument("--after", required=True, help="existing section name to insert the new section immediately after")
+
+    sp = sub.add_parser(
+        "remove-section",
+        description="Delete an empty '## <name>' section header. Refuses if the section still has tasks.",
+    )
+    sp.add_argument("name")
+
     sub.add_parser("validate")
 
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    _ensure_utf8_stdio()
     args = _build_parser().parse_args(argv)
 
     if args.file:
@@ -1508,16 +1786,33 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        tasks_path = repo_root / "docs" / "TASKS.md"
+        docs_dir = repo_root / "docs"
+        existing_names = {p.name for p in docs_dir.iterdir()} if docs_dir.is_dir() else set()
+        if "tasks.md" in existing_names:
+            tasks_path = docs_dir / "tasks.md"
+        elif "TASKS.md" in existing_names:
+            tasks_path = docs_dir / "TASKS.md"
+        else:
+            tasks_path = docs_dir / "tasks.md"
 
     if not tasks_path.exists():
-        print(f"tasks file not found: {tasks_path}", file=sys.stderr)
+        if args.file:
+            print(f"tasks file not found: {tasks_path}", file=sys.stderr)
+        else:
+            print(f"tasks file not found: {tasks_path} (or {tasks_path.parent / 'TASKS.md'})", file=sys.stderr)
         return 1
 
     if args.done_file:
         done_path = Path(args.done_file)
     else:
-        done_path = tasks_path.parent / "DONE.md"
+        parent_names = {p.name for p in tasks_path.parent.iterdir()} if tasks_path.parent.is_dir() else set()
+        if "done.md" in parent_names:
+            done_path = tasks_path.parent / "done.md"
+        elif "DONE.md" in parent_names:
+            done_path = tasks_path.parent / "DONE.md"
+        else:
+            done_name = "done.md" if tasks_path.name == "tasks.md" else "DONE.md"
+            done_path = tasks_path.parent / done_name
 
     try:
         _, parsed = _load(tasks_path)
@@ -1526,6 +1821,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     today = _dt.date.today().isoformat()
+    default_tasks_ref = "tasks.md" if tasks_path.name == "tasks.md" else "TASKS.md"
     if done_path.exists():
         try:
             _, parsed_done = _load(done_path)
@@ -1533,7 +1829,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"parse error in {done_path}: {e}", file=sys.stderr)
             return 1
     else:
-        parsed_done = parse_tasks_file(_default_done_text(today))
+        parsed_done = parse_tasks_file(_default_done_text(today, default_tasks_ref))
 
     done_ids = set(parsed_done.tasks_by_id().keys())
 
@@ -1566,15 +1862,30 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_edit(parsed, args, tasks_path, repo_root_for_git)
     if args.cmd == "close":
         return cmd_close(parsed, parsed_done, args, tasks_path, done_path, repo_root_for_git)
+    if args.cmd == "renumber":
+        # same one-git-log-call-per-invocation pattern as `add`'s --id reuse check
+        history_ids, history_warning = _git_history_ids(repo_root_for_git)
+        if history_warning:
+            print(f"tasks.py: {history_warning}", file=sys.stderr)
+        return cmd_renumber(parsed, done_ids, history_ids, args, tasks_path)
+    if args.cmd == "add-section":
+        return cmd_add_section(parsed, args, tasks_path)
+    if args.cmd == "remove-section":
+        return cmd_remove_section(parsed, args, tasks_path)
     if args.cmd == "validate":
         return cmd_validate(parsed, done_ids, tasks_path)
 
     raise AssertionError(f"unhandled subcommand {args.cmd!r}")
 
 
-if __name__ == "__main__":
+def cli_main() -> None:
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli_main()
+

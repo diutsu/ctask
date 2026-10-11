@@ -1835,3 +1835,365 @@ def test_scan_bare_raw_html_unit():
     assert tasks._scan_bare_raw_html("**Goal.** see <https://example.com> now\n") == []
     # double-backtick code span containing a single backtick still protects
     assert tasks._scan_bare_raw_html("**Goal.** use `` `<date>` `` quoted\n") == []
+
+
+# --------------------------------------------------------------------------
+# renumber — rename an open task's own id in place (`edit` refuses this);
+# also rewrites every other open task's blocked-by:: reference to it.
+# --------------------------------------------------------------------------
+RENUMBER_FIXTURE = """---
+type: requirement
+state: wip
+created: 2026-01-01
+updated: 2026-01-01
+cross-file-references: [docs/TASKS.md]
+---
+# Tasks
+
+## features
+
+### FEAT-10 — Base task
+
+- prio:: high
+- module:: features
+- created:: 2026-01-01
+
+**Goal.** Base thing.
+
+**Done when.** done.
+
+### FEAT-11 — Depends on base, annotated
+
+- prio:: medium
+- module:: features
+- created:: 2026-01-02
+- blocked-by:: FEAT-10 (needs base data)
+- refs:: docs/some-doc.md mentions FEAT-10
+
+**Goal.** Mentions FEAT-10 in prose too, should stay untouched.
+
+**Done when.** base done.
+
+### FEAT-12 — Depends on multiple
+
+- prio:: low
+- module:: features
+- created:: 2026-01-03
+- blocked-by:: FEAT-10, FEAT-11
+
+**Goal.** g.
+
+**Done when.** d.
+
+### FEAT-100 — Unrelated, no blocked-by
+
+- prio:: low
+- module:: features
+- created:: 2026-01-04
+
+**Goal.** g.
+
+**Done when.** d.
+"""
+
+
+@pytest.fixture()
+def renumber_file(tmp_path: Path) -> Path:
+    p = tmp_path / "TASKS-renumber.md"
+    p.write_text(RENUMBER_FIXTURE, encoding="utf-8")
+    return p
+
+
+def test_renumber_renames_header_and_stamps_edited(renumber_file, done_file, capsys):
+    rc, out, _ = run_captured(capsys, renumber_file, done_file, "renumber", "FEAT-10", "FEAT-77")
+    assert rc == 0
+    assert out.strip() == "FEAT-10 -> FEAT-77"
+
+    parsed = tasks.parse_tasks_file(renumber_file.read_text(encoding="utf-8"))
+    by_id = parsed.tasks_by_id()
+    assert "FEAT-10" not in by_id
+    renamed = by_id["FEAT-77"]
+    assert renamed.title == "Base task"
+    assert renamed.raw.startswith("### FEAT-77 — Base task\n")
+    assert renamed.meta.get("edited")
+
+
+def test_renumber_updates_annotated_blocked_by_preserving_note(renumber_file, done_file, capsys):
+    run_captured(capsys, renumber_file, done_file, "renumber", "FEAT-10", "FEAT-77")
+    parsed = tasks.parse_tasks_file(renumber_file.read_text(encoding="utf-8"))
+    feat11 = parsed.tasks_by_id()["FEAT-11"]
+    assert feat11.blocked_by == "FEAT-77 (needs base data)"
+    assert feat11.meta.get("edited")
+    # refs:: mentioning the old id is untouched — out of scope
+    assert feat11.refs == "docs/some-doc.md mentions FEAT-10"
+    # prose mentioning the old id is untouched — out of scope
+    assert "FEAT-10" in feat11.goal
+
+
+def test_renumber_updates_comma_separated_blocked_by_exact_token_only(renumber_file, done_file, capsys):
+    run_captured(capsys, renumber_file, done_file, "renumber", "FEAT-10", "FEAT-77")
+    parsed = tasks.parse_tasks_file(renumber_file.read_text(encoding="utf-8"))
+    feat12 = parsed.tasks_by_id()["FEAT-12"]
+    assert feat12.blocked_by == "FEAT-77, FEAT-11"
+
+
+def test_renumber_never_touches_untouched_task_bytes(renumber_file, done_file, capsys):
+    before = tasks.parse_tasks_file(RENUMBER_FIXTURE).tasks_by_id()["FEAT-100"].raw
+    run_captured(capsys, renumber_file, done_file, "renumber", "FEAT-10", "FEAT-77")
+    parsed = tasks.parse_tasks_file(renumber_file.read_text(encoding="utf-8"))
+    assert parsed.tasks_by_id()["FEAT-100"].raw == before
+
+
+def test_renumber_rejects_unknown_old_id(renumber_file, done_file, capsys):
+    rc, out, err = run_captured(capsys, renumber_file, done_file, "renumber", "FEAT-999", "FEAT-77")
+    assert rc == 1
+    assert "FEAT-999" in err
+    assert renumber_file.read_text(encoding="utf-8") == RENUMBER_FIXTURE
+
+
+def test_renumber_rejects_id_only_open_in_done_md(tasks_file, done_file, capsys):
+    done_file.write_text(DONE_FIXTURE, encoding="utf-8")
+    rc, out, err = run_captured(capsys, tasks_file, done_file, "renumber", "FEAT-24", "FEAT-88")
+    assert rc == 1
+    assert "FEAT-24" in err
+    assert "DONE.md" in err
+    assert tasks_file.read_text(encoding="utf-8") == FIXTURE
+
+
+@pytest.mark.parametrize("bad_new_id", ["feat-99", "ANL-16-STEP2", "toolong-1", "A-1"])
+def test_renumber_rejects_malformed_new_id_shape(renumber_file, done_file, capsys, bad_new_id):
+    rc, out, err = run_captured(capsys, renumber_file, done_file, "renumber", "FEAT-10", bad_new_id)
+    assert rc == 2
+    assert bad_new_id in err
+    assert renumber_file.read_text(encoding="utf-8") == RENUMBER_FIXTURE
+
+
+def test_renumber_rejects_collision_with_live_id(renumber_file, done_file, capsys):
+    rc, out, err = run_captured(capsys, renumber_file, done_file, "renumber", "FEAT-11", "FEAT-10")
+    assert rc == 1
+    assert "FEAT-10" in err
+    assert "live" in err
+    assert renumber_file.read_text(encoding="utf-8") == RENUMBER_FIXTURE
+
+
+def test_renumber_rejects_collision_with_closed_id(tasks_file, done_file, capsys):
+    done_file.write_text(DONE_FIXTURE, encoding="utf-8")
+    rc, out, err = run_captured(capsys, tasks_file, done_file, "renumber", "CLI-05", "FEAT-24")
+    assert rc == 1
+    assert "FEAT-24" in err
+    assert "DONE.md" in err
+    assert tasks_file.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_renumber_rejects_collision_with_retired_git_history_id(tmp_path: Path, capsys) -> None:
+    """Mirrors the add STOR-15 incident: a live task must not be renumbered
+    onto an id retired-only-in-git-history."""
+    docs_dir, _proj = _git_repo_with_commits(
+        tmp_path, STOR_FIXTURE, ["wip(stor-15-ui-replica): step 5 — docs + raw_data_api replica swap"],
+    )
+    rc, out, err = run_captured(
+        capsys, docs_dir / "TASKS.md", docs_dir / "DONE.md", "renumber", "STOR-14", "STOR-15",
+    )
+    assert rc == 1
+    assert "STOR-15" in err
+    assert "git" in err.lower()
+    assert (docs_dir / "TASKS.md").read_text(encoding="utf-8") == STOR_FIXTURE
+
+
+# --------------------------------------------------------------------------
+# add-section / remove-section
+# --------------------------------------------------------------------------
+def test_add_section_creates_empty_section_after_named_existing(sections_file, done_file, capsys):
+    rc, out, _ = run_captured(capsys, sections_file, done_file, "add-section", "docs", "--after", "fetcher")
+    assert rc == 0
+    assert out.strip() == "docs"
+
+    parsed = tasks.parse_tasks_file(sections_file.read_text(encoding="utf-8"))
+    names = [s.name for s in parsed.sections]
+    assert names == ["fetcher", "docs", "analysis", "interfaces — cli", "interfaces — ui"]
+    docs_section = next(s for s in parsed.sections if s.name == "docs")
+    assert docs_section.tasks == []
+    # neighbours untouched
+    assert parsed.tasks_by_id()["FET-01"].raw == tasks.parse_tasks_file(SECTIONS_FIXTURE).tasks_by_id()["FET-01"].raw
+    assert parsed.tasks_by_id()["ANL-01"].raw == tasks.parse_tasks_file(SECTIONS_FIXTURE).tasks_by_id()["ANL-01"].raw
+
+
+def test_add_section_at_end_after_last_section(sections_file, done_file, capsys):
+    rc, out, _ = run_captured(
+        capsys, sections_file, done_file, "add-section", "wrapup", "--after", "interfaces — ui",
+    )
+    assert rc == 0
+    parsed = tasks.parse_tasks_file(sections_file.read_text(encoding="utf-8"))
+    assert [s.name for s in parsed.sections][-1] == "wrapup"
+
+
+def test_add_section_rejects_duplicate_name(sections_file, done_file, capsys):
+    rc, out, err = run_captured(capsys, sections_file, done_file, "add-section", "fetcher", "--after", "analysis")
+    assert rc == 1
+    assert "fetcher" in err
+    assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
+
+
+def test_add_section_rejects_unknown_after_target(sections_file, done_file, capsys):
+    rc, out, err = run_captured(capsys, sections_file, done_file, "add-section", "docs", "--after", "nonexistent")
+    assert rc == 1
+    assert "nonexistent" in err
+    assert "fetcher" in err  # available sections listed
+    assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
+
+
+def test_add_section_then_remove_section_round_trips_cleanly(sections_file, done_file, capsys):
+    run_captured(capsys, sections_file, done_file, "add-section", "docs", "--after", "fetcher")
+    rc, out, _ = run_captured(capsys, sections_file, done_file, "remove-section", "docs")
+    assert rc == 0
+    assert out.strip() == "docs"
+    assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
+
+
+def test_remove_section_rejects_when_it_still_has_tasks(sections_file, done_file, capsys):
+    rc, out, err = run_captured(capsys, sections_file, done_file, "remove-section", "fetcher")
+    assert rc == 1
+    assert "fetcher" in err
+    assert "1" in err  # names the task count
+    assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
+
+
+def test_remove_section_rejects_unknown_name(sections_file, done_file, capsys):
+    rc, out, err = run_captured(capsys, sections_file, done_file, "remove-section", "nonexistent")
+    assert rc == 1
+    assert "nonexistent" in err
+    assert "fetcher" in err  # available sections listed
+    assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
+
+
+SLOPPY_SECTION_FIXTURE = """---
+type: requirement
+state: wip
+created: 2026-01-01
+updated: 2026-01-01
+cross-file-references: [docs/TASKS.md]
+---
+# Tasks
+
+## fetcher
+
+### FET-01 — placeholder fetcher task
+
+- prio:: low
+- module:: fetcher
+- created:: 2026-01-01
+
+**Goal.** placeholder.
+
+**Done when.** placeholder.
+
+
+## Legacy
+
+## analysis
+
+### ANL-01 — placeholder analysis task
+
+- prio:: low
+- module:: analysis
+- created:: 2026-01-01
+
+**Goal.** placeholder.
+
+**Done when.** placeholder.
+"""
+
+
+def test_remove_section_collapses_excess_blank_lines_left_at_the_seam(tmp_path: Path, done_file, capsys):
+    p = tmp_path / "TASKS-sloppy.md"
+    p.write_text(SLOPPY_SECTION_FIXTURE, encoding="utf-8")
+    # sanity: the fixture really does have a 2-blank-line run ahead of the seam
+    assert "placeholder.\n\n\n## Legacy" in SLOPPY_SECTION_FIXTURE
+
+    rc, out, _ = run_captured(capsys, p, done_file, "remove-section", "Legacy")
+    assert rc == 0
+    text = p.read_text(encoding="utf-8")
+    assert "\n\n\n" not in text  # no run of more than one blank line survives
+    assert "placeholder.\n\n## analysis" in text
+    parsed = tasks.parse_tasks_file(text)
+    assert [s.name for s in parsed.sections] == ["fetcher", "analysis"]
+    assert parsed.tasks_by_id()["FET-01"].goal == "placeholder."
+    assert parsed.tasks_by_id()["ANL-01"].goal == "placeholder."
+
+
+# --------------------------------------------------------------------------
+# Lowercase v2 (docs/tasks.md + docs/done.md) and legacy (TASKS.md + DONE.md) discovery
+# --------------------------------------------------------------------------
+def test_default_discovery_prefers_lowercase_tasks_and_done_md(tmp_path: Path, monkeypatch, capsys) -> None:
+    proj = tmp_path / "proj_v2"
+    docs_dir = proj / "docs"
+    docs_dir.mkdir(parents=True)
+    (docs_dir / "tasks.md").write_text(FIXTURE, encoding="utf-8")
+
+    subprocess.run(["git", "init", "-q"], cwd=proj, check=True)
+    monkeypatch.chdir(proj)
+
+    rc = tasks.main(["close", "FEAT-15"])
+    assert rc == 0
+    names = {p.name for p in docs_dir.iterdir()}
+    assert "done.md" in names
+    assert "DONE.md" not in names
+    done_text = (docs_dir / "done.md").read_text(encoding="utf-8")
+    assert "cross-file-references: [docs/tasks.md]" in done_text
+    assert "### FEAT-15" in done_text
+
+
+def test_default_discovery_falls_back_to_uppercase_tasks_and_done_md(tmp_path: Path, monkeypatch, capsys) -> None:
+    proj = tmp_path / "proj_v1"
+    docs_dir = proj / "docs"
+    docs_dir.mkdir(parents=True)
+    (docs_dir / "TASKS.md").write_text(FIXTURE, encoding="utf-8")
+
+    subprocess.run(["git", "init", "-q"], cwd=proj, check=True)
+    monkeypatch.chdir(proj)
+
+    rc = tasks.main(["close", "FEAT-15"])
+    assert rc == 0
+    names = {p.name for p in docs_dir.iterdir()}
+    assert "DONE.md" in names
+    assert "done.md" not in names
+    done_text = (docs_dir / "DONE.md").read_text(encoding="utf-8")
+    assert "cross-file-references: [docs/TASKS.md]" in done_text
+    assert "### FEAT-15" in done_text
+
+
+def test_windows_crlf_input_parses_and_atomic_write_outputs_lf_only(tmp_path: Path, done_file, capsys) -> None:
+    p = tmp_path / "tasks.md"
+    crlf_bytes = FIXTURE.replace("\n", "\r\n").encode("utf-8")
+    p.write_bytes(crlf_bytes)
+
+    parsed = tasks.parse_tasks_file(crlf_bytes.decode("utf-8"))
+    assert "FEAT-15" in parsed.tasks_by_id()
+
+    rc, _, _ = run_captured(capsys, p, done_file, "edit", "FEAT-15", "--prio", "low")
+    assert rc == 0
+    written_bytes = p.read_bytes()
+    assert b"\r\n" not in written_bytes
+
+
+def test_windows_backslash_path_matches_in_refs_referencing(tasks_file, done_file, capsys) -> None:
+    rc, out, _ = run_captured(
+        capsys, tasks_file, done_file, "refs", "--referencing", r"src\features\sentiment.py",
+    )
+    assert rc == 0
+    assert "FEAT-15" in out
+
+
+def test_cp1252_console_encoding_does_not_crash_on_em_dash(tasks_file) -> None:
+    import os
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "cp1252"
+    res = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--file", str(tasks_file), "show", "FEAT-15"],
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+    assert res.returncode == 0
+    assert "FEAT-15 — Improve sentiment scoring".encode("utf-8") in res.stdout

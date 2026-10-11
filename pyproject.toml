@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ctask"
-version = "0.1.0"
-description = "CLI for reading / listing / searching / writing tasks in a markdown task registry (docs/TASKS.md)"
-requires-python = ">=3.8"
+version = "0.2.0"
+description = "CLI for reading / listing / searching / writing tasks in a markdown task registry (docs/tasks.md or docs/TASKS.md)"
+requires-python = ">=3.9"
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest"]
 
 [project.scripts]
-ctask = "ctask:main"
+ctask = "ctask:cli_main"
 
 [tool.setuptools]
 py-modules = ["ctask"]
+
