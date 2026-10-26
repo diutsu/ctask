@@ -90,5 +90,15 @@ Each open task is an H3 span under an H2 module-section header:
 
 - **Metadata bullets (`- key:: value`):** `prio::`, `module::`, and `created::` are required; `blocked-by::` and `refs::` are optional; unknown extra keys are preserved.
 - **Prose sections:** `**Goal.**`, `**Details.**` (optional), and `**Done when.**`.
-- **Per-project module map (`docs/.ctask`):** Optional JSON file `{"modules": {"<mod>": {"prefix": "<PFX>", "section": "<section-name>"}}}` that extends/overrides the built-in module-to-prefix map for that repository.
+- **Per-project config (`.ctask`, next to the registry):** Optional JSON file — there is no builtin module map, so without this file `add`'s auto-id/section inference and `edit --module`'s move-on-module behavior need explicit `--id`/`--id-prefix` + `--section` instead. All keys are optional:
+  ```json
+  {
+    "modules": {"cr": {"prefix": "CR", "section": "code review"}},
+    "historical_prefixes": {"INT-SCH": "SCH"},
+    "repo_root": ".."
+  }
+  ```
+  - `modules`: `--module` -> (id-prefix, default section).
+  - `historical_prefixes`: old (possibly hyphenated) commit-scope prefixes that must still count as retired under their renamed prefix today.
+  - `repo_root`: git repo root for commit-history scans, relative paths resolved against the `.ctask` file's own directory; defaults to the git repo containing the registry, else the registry's grandparent directory.
 - **Byte-identical round-tripping:** Every untouched task span is preserved verbatim with LF (`\n`) line endings across all platforms.

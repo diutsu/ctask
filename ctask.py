@@ -5,8 +5,7 @@
 # ///
 """Helper CLI for reading / listing / searching / writing tasks in `docs/tasks.md` (or `docs/TASKS.md`).
 
-`docs/tasks.md` (v2 format — see docs/plan-tasks-format-v2 spec) holds every open
-task as an H3 entry under a `## <module>` section:
+`docs/tasks.md` holds every open task as an H3 entry under a `## <module>` section:
 
     ### SCH-17 — mimir disk pressure blocks the queue model
 
@@ -36,16 +35,38 @@ untouched spans are never re-rendered — so a parse of an unmodified file,
 serialized back out, is byte-identical to the input. If parsing fails for any
 reason, nothing is written.
 
-Per-project module map: an optional `<repo_root>/docs/.ctask` JSON file
-(`{"modules": {"cr": {"prefix": "CR", "section": "..."}}}`) extends and
-overrides the builtin `_MODULE_PREFIX_MAP` for that repo only — the builtin
-map is always the fallback/default. See `_load_project_module_map`.
+Per-project config: an optional `.ctask` JSON file next to the registry (i.e.
+`<registry's dir>/.ctask` — `docs/.ctask` in the normal layout, and this also
+works when `--file` points somewhere else). There is no builtin module map —
+without this file, `add`/`edit` can only place a task by explicit `--id` (or
+`--id-prefix`) and `--section`. Recognized keys, all optional:
+
+    {
+      "modules": {"cr": {"prefix": "CR", "section": "code review"}},
+      "historical_prefixes": {"INT-SCH": "SCH"},
+      "repo_root": ".."
+    }
+
+- `modules`: `--module` -> (id-prefix, default section) for `add`'s
+  auto-id/section inference and `edit --module`'s move-on-module behavior.
+  See `_lookup_module_mapping`.
+- `historical_prefixes`: old (possibly hyphenated) commit-scope prefixes that
+  must still count as retired under their renamed prefix today (e.g. a
+  historical `int-sch-13` commit scope must block `SCH-13` from being
+  reissued). See `_extract_id_from_scope`.
+- `repo_root`: path to the git repo root used for commit-history scans
+  (retired-id protection, `close`'s commit lookup), relative paths resolved
+  against the `.ctask` file's own directory. Without it: the git repo
+  containing the registry, else `<registry's dir>/..`.
+
+See `_load_project_config`.
 
 This script lives in a global skill directory shared by every project, so the
 registry is resolved from the current git repository, not from the script's own
 location: `git rev-parse --show-toplevel` finds the repo root, and the registry
-is `<root>/docs/tasks.md` (done ledger: `<root>/docs/done.md`, with fallback to
-`TASKS.md` / `DONE.md`). Use `--file` / `--done-file` to override (mainly for tests).
+is `<root>/docs/tasks.md` (falling back to `<root>/docs/TASKS.md`; done ledger:
+next to the registry as `done.md`, falling back to `DONE.md`). Use `--file` /
+`--done-file` to override (mainly for tests).
 
 Usage:
     ctask list [--prio P] [--module M] [--blocked] [--unblocked] [--ids-only]
@@ -112,27 +133,15 @@ _FENCE_RE = re.compile(r"^```")
 # module sections (spec: "the H1, the TOC, and 'How to use this file' stay").
 _NON_MODULE_SECTION_NAMES = {"TOC", "How to use this file"}
 
-# --module -> (id-prefix, default "## <section>" name). Matched on the module's
-# leading segment(s), longest-match-wins (e.g. "interfaces.cli" -> CLI /
-# "interfaces — cli", not a bare "interfaces" entry, which doesn't exist).
-# Single source of truth for BOTH id-prefix inference and section placement —
-# a task's `--module` (e.g. "analysis.signals") almost never spells its
-# section header ("analysis") literally, so these must not be two maps that
-# can drift apart. Source of truth: docs/TASKS.md §"How to use this file" +
-# its actual "## " section headers (verified against the real file).
-_MODULE_PREFIX_MAP = {
-    "fetcher": ("FET", "fetcher"),
-    "features": ("FEAT", "features"),
-    "backtest": ("BACK", "backtest"),
-    "analysis": ("ANL", "analysis"),
-    "storage": ("STOR", "storage"),
-    "interfaces.cli": ("CLI", "interfaces — cli"),
-    "interfaces.ui": ("UI", "interfaces — ui"),
-    "interfaces.scheduler": ("SCH", "interfaces — scheduler"),
-    "interfaces.notifications": ("NOTI", "interfaces — notifications"),
-    "interfaces.mcp": ("MCP", "interfaces — mcp"),
-    "meta": ("META", "meta — cross-cutting"),
-}
+# There is no builtin --module -> (id-prefix, section) map: every project's
+# table comes solely from its own `.ctask` "modules" key (see
+# `_load_project_config`). Matched on the module's leading segment(s),
+# longest-match-wins (e.g. "interfaces.cli" -> CLI / "interfaces — cli", not
+# a bare "interfaces" entry if that one isn't itself mapped). Single source
+# of truth for BOTH id-prefix inference and section placement — a task's
+# `--module` (e.g. "analysis.signals") almost never spells its section
+# header ("analysis") literally, so these must not be two maps that can
+# drift apart.
 
 
 class TasksParseError(Exception):
@@ -551,43 +560,36 @@ def _append_body_section(raw: str, label: str, text: str) -> str:
 # DONE.md (closed-through-the-script). Nothing has ever been closed *through*
 # the script, so DONE.md has never existed and that union was, in practice,
 # just "live ids" — every id retired before this script existed (renamed,
-# renumbered, or closed by hand) was silently re-issuable. STOR-15 (a live
-# architectural concept referenced from docs, landed 2026-07-03) got handed
-# out again as a fresh id because of exactly this gap. Git commit history is
-# the one durable record of every id ever used, so it's now a mandatory third
-# source.
+# renumbered, or closed by hand) was silently re-issuable. Git commit history
+# is the one durable record of every id ever used, so it's now a mandatory
+# third source.
 _COMMIT_SCOPE_RE = re.compile(r"^[a-zA-Z]+\(([^()]+)\):")
 _SCOPE_ID_RE = re.compile(r"^([a-zA-Z]+(?:-[a-zA-Z]+)*)-([0-9]+)")
 
-# Renamed this session: git history still carries the old spellings, but they
-# must count as used under the new prefix — otherwise the old number is
-# re-issuable under the new prefix (e.g. INT-SCH-13 in history must block
-# SCH-13 today).
-_HISTORICAL_PREFIX_NORMALIZE = {
-    "INT-CLI": "CLI",
-    "INT-UI": "UI",
-    "INT-SCH": "SCH",
-    "INT-NOTIF": "NOTI",
-    "INT-MCP": "MCP",
-}
 
-
-def _extract_id_from_scope(scope: str) -> str | None:
+def _extract_id_from_scope(scope: str, historical_prefixes: dict[str, str] | None = None) -> str | None:
     """Pull the leading `PREFIX-NNN` id out of a commit scope slug.
 
     Scopes are sometimes a bare id (`fet-38`), sometimes an id with a
     trailing descriptive slug (`stor-15-ui-replica`, `int-sch-13-queue-stats`
     -> `stor-15` / `int-sch-13`), and sometimes not an id at all
     (`backtest-rebuild`) — that last shape returns None rather than raising.
+
+    `historical_prefixes` (from `.ctask`'s "historical_prefixes" key, default
+    none) normalizes an old, possibly-retired prefix spelling onto its
+    current one — a project that renamed e.g. `INT-SCH` to `SCH` wants a
+    historical `int-sch-13` commit scope to still block `SCH-13` today, or
+    the old number would be silently re-issuable under the new prefix.
     """
     m = _SCOPE_ID_RE.match(scope)
     if not m:
         return None
-    prefix = _HISTORICAL_PREFIX_NORMALIZE.get(m.group(1).upper(), m.group(1).upper())
+    historical_prefixes = historical_prefixes or {}
+    prefix = historical_prefixes.get(m.group(1).upper(), m.group(1).upper())
     return f"{prefix}-{m.group(2)}"
 
 
-def _git_history_ids(repo_root: Path) -> tuple[set[str], str | None]:
+def _git_history_ids(repo_root: Path, historical_prefixes: dict[str, str] | None = None) -> tuple[set[str], str | None]:
     """Every id ever used as a commit scope across all of git history.
 
     Returns `(ids, warning)`. `warning` is set (and `ids` is whatever could
@@ -611,7 +613,7 @@ def _git_history_ids(repo_root: Path) -> tuple[set[str], str | None]:
         m = _COMMIT_SCOPE_RE.match(subject)
         if not m:
             continue
-        extracted = _extract_id_from_scope(m.group(1))
+        extracted = _extract_id_from_scope(m.group(1), historical_prefixes)
         if extracted:
             ids.add(extracted)
     return ids, None
@@ -892,22 +894,32 @@ def cmd_refs(parsed: ParsedFile, args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# add
+# per-project config — `.ctask`, a JSON file next to the registry (see the
+# module docstring for the full key list). Loaded and validated exactly once
+# per invocation, in `main`, via `_load_project_config`.
 # --------------------------------------------------------------------------
-def _load_project_module_map(repo_root: Path | None) -> dict[str, tuple[str, str]]:
-    """Load `<repo_root>/docs/.ctask`'s "modules" map, or {} if `repo_root`
-    is None or the file doesn't exist.
+_HISTORICAL_PREFIX_KEY_RE = re.compile(r"^[A-Z]+(-[A-Z]+)*$")
 
-    Config shape: `{"modules": {"cr": {"prefix": "CR", "section": "..."}}}`.
-    Malformed config (bad JSON, missing "modules", a bad entry) raises
-    ValueError naming the file path and what's wrong — never silently
-    ignored or partially applied.
+
+@dataclass
+class ProjectConfig:
+    modules: dict[str, tuple[str, str]] = field(default_factory=dict)
+    historical_prefixes: dict[str, str] = field(default_factory=dict)
+    repo_root: Path | None = None
+
+
+def _load_project_config(config_path: Path | None) -> ProjectConfig:
+    """Load and validate `config_path` (the `.ctask` file next to a
+    registry), or an all-empty `ProjectConfig` if `config_path` is None or
+    doesn't exist.
+
+    Every key is optional; a config may carry only some of them (or none).
+    Malformed config (bad JSON, a bad entry under a key that IS present)
+    raises ValueError naming the file path and what's wrong — never
+    silently ignored or partially applied.
     """
-    if repo_root is None:
-        return {}
-    config_path = repo_root / "docs" / ".ctask"
-    if not config_path.exists():
-        return {}
+    if config_path is None or not config_path.exists():
+        return ProjectConfig()
     try:
         raw = config_path.read_text(encoding="utf-8")
     except OSError as e:
@@ -916,58 +928,95 @@ def _load_project_module_map(repo_root: Path | None) -> dict[str, tuple[str, str
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         raise ValueError(f"{config_path}: invalid JSON ({e})") from e
-    if not isinstance(data, dict) or "modules" not in data:
-        raise ValueError(f"{config_path}: missing required 'modules' key")
-    modules = data["modules"]
-    if not isinstance(modules, dict):
-        raise ValueError(f"{config_path}: 'modules' must be a dict")
-    out: dict[str, tuple[str, str]] = {}
-    for key, entry in modules.items():
-        if not isinstance(entry, dict) or "prefix" not in entry or "section" not in entry:
-            raise ValueError(f"{config_path}: module {key!r} entry must have 'prefix' and 'section'")
-        prefix = entry["prefix"]
-        section = entry["section"]
-        if not isinstance(prefix, str) or not _ID_PREFIX_RE.match(prefix):
-            raise ValueError(f"{config_path}: module {key!r} prefix {prefix!r} must be 2-4 uppercase letters")
-        if not isinstance(section, str) or not section.strip():
-            raise ValueError(f"{config_path}: module {key!r} section must be a non-empty string")
-        out[key] = (prefix, section)
-    return out
+    if not isinstance(data, dict):
+        raise ValueError(f"{config_path}: top-level JSON must be an object")
+
+    modules: dict[str, tuple[str, str]] = {}
+    if "modules" in data:
+        raw_modules = data["modules"]
+        if not isinstance(raw_modules, dict):
+            raise ValueError(f"{config_path}: 'modules' must be a dict")
+        for key, entry in raw_modules.items():
+            if not isinstance(entry, dict) or "prefix" not in entry or "section" not in entry:
+                raise ValueError(f"{config_path}: module {key!r} entry must have 'prefix' and 'section'")
+            prefix = entry["prefix"]
+            section = entry["section"]
+            if not isinstance(prefix, str) or not _ID_PREFIX_RE.match(prefix):
+                raise ValueError(f"{config_path}: module {key!r} prefix {prefix!r} must be 2-4 uppercase letters")
+            if not isinstance(section, str) or not section.strip():
+                raise ValueError(f"{config_path}: module {key!r} section must be a non-empty string")
+            modules[key] = (prefix, section)
+
+    historical_prefixes: dict[str, str] = {}
+    if "historical_prefixes" in data:
+        raw_hist = data["historical_prefixes"]
+        if not isinstance(raw_hist, dict):
+            raise ValueError(f"{config_path}: 'historical_prefixes' must be a dict")
+        for key, value in raw_hist.items():
+            if not isinstance(key, str) or not _HISTORICAL_PREFIX_KEY_RE.match(key):
+                raise ValueError(
+                    f"{config_path}: historical_prefixes key {key!r} must be uppercase letters "
+                    "(optionally hyphen-separated, e.g. 'INT-SCH')"
+                )
+            if not isinstance(value, str) or not _ID_PREFIX_RE.match(value):
+                raise ValueError(f"{config_path}: historical_prefixes[{key!r}] {value!r} must be 2-4 uppercase letters")
+            historical_prefixes[key] = value
+
+    repo_root: Path | None = None
+    if "repo_root" in data:
+        raw_root = data["repo_root"]
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            raise ValueError(f"{config_path}: 'repo_root' must be a non-empty string")
+        candidate = Path(raw_root)
+        repo_root = candidate if candidate.is_absolute() else (config_path.parent / candidate).resolve()
+
+    return ProjectConfig(modules=modules, historical_prefixes=historical_prefixes, repo_root=repo_root)
 
 
-def _lookup_module_mapping(module: str, repo_root: Path | None = None) -> tuple[str, str]:
+def _lookup_module_mapping(module: str, modules: dict[str, tuple[str, str]] | None = None) -> tuple[str, str]:
     """(id-prefix, default "## <section>" name) for a --module value.
 
     Longest dotted-segment match wins: "interfaces.cli" -> ("CLI",
     "interfaces — cli") (specific submodule mapping beats nothing);
     "analysis.signals" -> ("ANL", "analysis") (no submodule-specific mapping,
-    falls back to the top-level "analysis" entry).
+    falls back to the top-level "analysis" entry, if that one is mapped).
 
     Single lookup backs both `add`'s id-prefix inference and its default
     section placement — they must never be two maps that can drift apart.
 
-    `repo_root`, when given, layers `<repo_root>/docs/.ctask` (project
-    config) over the builtin `_MODULE_PREFIX_MAP` — project config wins on
-    key collision, builtin is the fallback/default. `repo_root=None`
-    (default) preserves exactly the builtin-only behavior.
+    `modules` is the project's `.ctask` "modules" map (see
+    `_load_project_config`); there is no builtin fallback — `modules=None`
+    (default) means no mapping exists at all, for any module.
     """
-    project_map = _load_project_module_map(repo_root)
-    combined = {**_MODULE_PREFIX_MAP, **project_map}
+    modules = modules or {}
     segments = module.split(".")
     for k in range(len(segments), 0, -1):
         candidate = ".".join(segments[:k])
-        if candidate in combined:
-            return combined[candidate]
-    known = ", ".join(f"{m} -> {p}" for m, (p, _s) in sorted(combined.items()))
-    raise ValueError(f"--module {module!r} doesn't map to a known id prefix; known mappings: {known}")
+        if candidate in modules:
+            return modules[candidate]
+    if modules:
+        known = ", ".join(f"{m} -> {p}" for m, (p, _s) in sorted(modules.items()))
+        raise ValueError(f"--module {module!r} doesn't map to a known id prefix; known mappings: {known}")
+    raise ValueError(f"--module {module!r} doesn't map to a known id prefix (no module mappings configured)")
 
 
-def _infer_prefix_from_module(module: str, repo_root: Path | None = None) -> str:
-    return _lookup_module_mapping(module, repo_root)[0]
+def _infer_prefix_from_module(module: str, modules: dict[str, tuple[str, str]] | None = None) -> str:
+    return _lookup_module_mapping(module, modules)[0]
 
 
-def _infer_section_from_module(module: str, repo_root: Path | None = None) -> str:
-    return _lookup_module_mapping(module, repo_root)[1]
+def _infer_section_from_module(module: str, modules: dict[str, tuple[str, str]] | None = None) -> str:
+    return _lookup_module_mapping(module, modules)[1]
+
+
+def _unmapped_module_hint(module: str, config_path: Path) -> str:
+    """Extra guidance appended to a `ValueError` from `_lookup_module_mapping`
+    when `add`/`edit` is about to report it — where to add the mapping, or
+    the explicit flags that sidestep it entirely."""
+    return (
+        f"add it to {config_path} (created if missing), e.g.:\n"
+        f'  {{"modules": {{"{module}": {{"prefix": "XXX", "section": "<section name, without ##>"}}}}}}\n'
+        'or pass --id-prefix XXX and --section "<section name>" explicitly'
+    )
 
 
 def _next_free_id(prefix: str, used_ids: set[str]) -> str:
@@ -1024,7 +1073,7 @@ def _render_new_task(
 
 def cmd_add(
     parsed: ParsedFile, done_ids: set[str], history_ids: set[str],
-    args: argparse.Namespace, tasks_path: Path, repo_root: Path | None = None,
+    args: argparse.Namespace, tasks_path: Path, modules: dict[str, tuple[str, str]] | None = None,
 ) -> int:
     by_id = parsed.tasks_by_id()
     live_ids = set(by_id.keys())
@@ -1056,9 +1105,9 @@ def cmd_add(
                 return 2
         else:
             try:
-                prefix = _infer_prefix_from_module(args.module, repo_root)
+                prefix = _infer_prefix_from_module(args.module, modules)
             except ValueError as e:
-                print(f"add: {e}", file=sys.stderr)
+                print(f"add: {e} — {_unmapped_module_hint(args.module, tasks_path.parent / '.ctask')}", file=sys.stderr)
                 return 1
         try:
             task_id = _next_free_id(prefix, live_ids | retired_ids)
@@ -1077,9 +1126,9 @@ def cmd_add(
         section_name = args.section
     else:
         try:
-            section_name = _infer_section_from_module(args.module, repo_root)
+            section_name = _infer_section_from_module(args.module, modules)
         except ValueError as e:
-            print(f"add: {e}", file=sys.stderr)
+            print(f"add: {e} — {_unmapped_module_hint(args.module, tasks_path.parent / '.ctask')}", file=sys.stderr)
             return 1
 
     section = next((s for s in parsed.sections if s.name == section_name), None)
@@ -1232,7 +1281,9 @@ def cmd_remove_section(parsed: ParsedFile, args: argparse.Namespace, tasks_path:
 # --------------------------------------------------------------------------
 # edit
 # --------------------------------------------------------------------------
-def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, repo_root: Path | None = None) -> int:
+def cmd_edit(
+    parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, modules: dict[str, tuple[str, str]] | None = None,
+) -> int:
     by_id = parsed.tasks_by_id()
     t = by_id.get(args.id)
     if t is None:
@@ -1270,10 +1321,13 @@ def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, rep
         target_section_name = args.section
     elif args.module:
         try:
-            target_section_name = _infer_section_from_module(args.module, repo_root)
-        except ValueError as e:
-            print(f"edit: {e} (or pass --section explicitly)", file=sys.stderr)
-            return 1
+            target_section_name = _infer_section_from_module(args.module, modules)
+        except ValueError:
+            # an unmapped --module with no --section override is not an
+            # error here (unlike `add`, which has no existing span to fall
+            # back to) — the module:: bullet still gets updated below, the
+            # task just isn't moved to a different section.
+            target_section_name = None
     target_section: Section | None = None
     if target_section_name is not None:
         target_section = next((s for s in parsed.sections if s.name == target_section_name), None)
@@ -1624,9 +1678,9 @@ def cmd_validate(parsed: ParsedFile, done_ids: set[str], tasks_path: Path) -> in
                 problems.append(f"{tasks_path}:{t.header_line}: {t.id} refs has an empty entry: {t.refs!r}")
         if not t.goal.strip():
             problems.append(f"{tasks_path}:{t.header_line}: {t.id} has an empty or missing **Goal.** section")
-        # warning, not error: real registries predate the rule (4 tasks in
-        # repit lack Done when today) — a hard error would brick validate for
-        # every existing file at once.
+        # warning, not error: real registries predate the rule (some existing
+        # tasks lack a Done when today) — a hard error would brick validate
+        # for every existing file at once.
         if not t.done_when.strip():
             warnings.append(f"{tasks_path}:{t.header_line}: {t.id} has no **Done when.** section")
         # warning, not error, for the same reason: live registries already
@@ -1688,8 +1742,14 @@ def _ensure_utf8_stdio() -> None:
 # --------------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ctask", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", default=None, help="path to TASKS.md (default: <git repo root>/docs/TASKS.md)")
-    p.add_argument("--done-file", default=None, help="path to the completed-task ledger (default: <TASKS.md's dir>/DONE.md)")
+    p.add_argument(
+        "--file", default=None,
+        help="path to the registry (default: <git repo root>/docs/tasks.md, falling back to TASKS.md)",
+    )
+    p.add_argument(
+        "--done-file", default=None,
+        help="path to the completed-task ledger (default: next to the registry, as done.md, falling back to DONE.md)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("list")
@@ -1806,17 +1866,18 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_utf8_stdio()
     args = _build_parser().parse_args(argv)
 
+    git_repo_root: Path | None = None
     if args.file:
         tasks_path = Path(args.file)
     else:
-        repo_root = _find_repo_root(Path.cwd())
-        if repo_root is None:
+        git_repo_root = _find_repo_root(Path.cwd())
+        if git_repo_root is None:
             print(
-                f"tasks.py: not inside a git repository (cwd={Path.cwd()}); pass --file to override",
+                f"ctask: not inside a git repository (cwd={Path.cwd()}); pass --file to override",
                 file=sys.stderr,
             )
             return 1
-        docs_dir = repo_root / "docs"
+        docs_dir = git_repo_root / "docs"
         existing_names = {p.name for p in docs_dir.iterdir()} if docs_dir.is_dir() else set()
         if "tasks.md" in existing_names:
             tasks_path = docs_dir / "tasks.md"
@@ -1863,6 +1924,13 @@ def main(argv: list[str] | None = None) -> int:
 
     done_ids = set(parsed_done.tasks_by_id().keys())
 
+    config_path = tasks_path.parent / ".ctask"
+    try:
+        project_config = _load_project_config(config_path)
+    except ValueError as e:
+        print(f"ctask: {e}", file=sys.stderr)
+        return 1
+
     if args.cmd == "list":
         return cmd_list(parsed, args)
     if args.cmd == "show":
@@ -1875,28 +1943,35 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_blocking(parsed, args)
     if args.cmd == "refs":
         return cmd_refs(parsed, args)
-    # tasks_path is always <repo root>/docs/TASKS.md, whether resolved via
-    # git or via --file pointing at a like-shaped fixture — two parents up
-    # is the repo root either way.
-    repo_root_for_git = tasks_path.parent.parent
+    # The repo root used for git history scans / commit lookups: an explicit
+    # `.ctask` "repo_root" wins; else the git root the registry was resolved
+    # from (when `--file` wasn't used to bypass that resolution); else the
+    # registry's grandparent dir (the layout's repo root, <root>/docs/*.md),
+    # which also keeps existing --file-pointed-at-a-fixture tests working.
+    if project_config.repo_root is not None:
+        repo_root_for_git = project_config.repo_root
+    elif git_repo_root is not None:
+        repo_root_for_git = git_repo_root
+    else:
+        repo_root_for_git = tasks_path.parent.parent
 
     if args.cmd == "add":
         # One git-log call per `add` invocation (not per candidate id) —
         # both the explicit --id check and the auto-assign path below reuse
         # this same set.
-        history_ids, history_warning = _git_history_ids(repo_root_for_git)
+        history_ids, history_warning = _git_history_ids(repo_root_for_git, project_config.historical_prefixes)
         if history_warning:
-            print(f"tasks.py: {history_warning}", file=sys.stderr)
-        return cmd_add(parsed, done_ids, history_ids, args, tasks_path, repo_root_for_git)
+            print(f"ctask: {history_warning}", file=sys.stderr)
+        return cmd_add(parsed, done_ids, history_ids, args, tasks_path, project_config.modules)
     if args.cmd == "edit":
-        return cmd_edit(parsed, args, tasks_path, repo_root_for_git)
+        return cmd_edit(parsed, args, tasks_path, project_config.modules)
     if args.cmd == "close":
         return cmd_close(parsed, parsed_done, args, tasks_path, done_path, repo_root_for_git)
     if args.cmd == "renumber":
         # same one-git-log-call-per-invocation pattern as `add`'s --id reuse check
-        history_ids, history_warning = _git_history_ids(repo_root_for_git)
+        history_ids, history_warning = _git_history_ids(repo_root_for_git, project_config.historical_prefixes)
         if history_warning:
-            print(f"tasks.py: {history_warning}", file=sys.stderr)
+            print(f"ctask: {history_warning}", file=sys.stderr)
         return cmd_renumber(parsed, done_ids, history_ids, args, tasks_path)
     if args.cmd == "add-section":
         return cmd_add_section(parsed, args, tasks_path)

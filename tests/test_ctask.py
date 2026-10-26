@@ -1,4 +1,4 @@
-"""Tests for tasks.py — the docs/TASKS.md v2 read/search/write helper.
+"""Tests for ctask.py — the docs/TASKS.md v2 read/search/write helper.
 
 All fixtures are synthetic TASKS.md / DONE.md files built in tmp_path. The real
 docs/TASKS.md is never read or touched.
@@ -135,10 +135,41 @@ Ledger of completed tasks, moved out of docs/TASKS.md on close. Never reuse a li
 """
 
 
+# There is no builtin --module map in ctask itself (it comes solely from a
+# project's own `.ctask`); this is the table every real registry used to get
+# for free, now written out as a `.ctask` fixture so tests that exercise
+# module -> id-prefix/section inference keep exercising it end-to-end.
+_TEST_MODULES = {
+    "fetcher": ("FET", "fetcher"),
+    "features": ("FEAT", "features"),
+    "backtest": ("BACK", "backtest"),
+    "analysis": ("ANL", "analysis"),
+    "storage": ("STOR", "storage"),
+    "interfaces.cli": ("CLI", "interfaces — cli"),
+    "interfaces.ui": ("UI", "interfaces — ui"),
+    "interfaces.scheduler": ("SCH", "interfaces — scheduler"),
+    "interfaces.notifications": ("NOTI", "interfaces — notifications"),
+    "interfaces.mcp": ("MCP", "interfaces — mcp"),
+    "meta": ("META", "meta — cross-cutting"),
+}
+_TEST_MODULES_CONFIG = {
+    "modules": {
+        mod: {"prefix": prefix, "section": section} for mod, (prefix, section) in _TEST_MODULES.items()
+    },
+}
+
+
+def _write_ctask_config(directory: Path, config: dict) -> Path:
+    config_path = directory / ".ctask"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return config_path
+
+
 @pytest.fixture()
 def tasks_file(tmp_path: Path) -> Path:
     p = tmp_path / "TASKS.md"
     p.write_text(FIXTURE, encoding="utf-8")
+    _write_ctask_config(tmp_path, _TEST_MODULES_CONFIG)
     return p
 
 
@@ -488,39 +519,64 @@ def test_add_auto_assign_skips_ids_closed_in_done_md(tasks_file, done_file, caps
 # add — CHANGE 3: prefix inference from --module
 # --------------------------------------------------------------------------
 def test_infer_prefix_from_module_top_level_mappings():
-    assert tasks._infer_prefix_from_module("fetcher") == "FET"
-    assert tasks._infer_prefix_from_module("features") == "FEAT"
-    assert tasks._infer_prefix_from_module("backtest") == "BACK"
-    assert tasks._infer_prefix_from_module("analysis") == "ANL"
-    assert tasks._infer_prefix_from_module("storage") == "STOR"
-    assert tasks._infer_prefix_from_module("meta") == "META"
+    assert tasks._infer_prefix_from_module("fetcher", _TEST_MODULES) == "FET"
+    assert tasks._infer_prefix_from_module("features", _TEST_MODULES) == "FEAT"
+    assert tasks._infer_prefix_from_module("backtest", _TEST_MODULES) == "BACK"
+    assert tasks._infer_prefix_from_module("analysis", _TEST_MODULES) == "ANL"
+    assert tasks._infer_prefix_from_module("storage", _TEST_MODULES) == "STOR"
+    assert tasks._infer_prefix_from_module("meta", _TEST_MODULES) == "META"
 
 
 def test_infer_prefix_from_module_longest_match_wins_for_interfaces_submodules():
-    assert tasks._infer_prefix_from_module("interfaces.cli") == "CLI"
-    assert tasks._infer_prefix_from_module("interfaces.ui") == "UI"
-    assert tasks._infer_prefix_from_module("interfaces.scheduler") == "SCH"
-    assert tasks._infer_prefix_from_module("interfaces.notifications") == "NOTI"
-    assert tasks._infer_prefix_from_module("interfaces.mcp") == "MCP"
+    assert tasks._infer_prefix_from_module("interfaces.cli", _TEST_MODULES) == "CLI"
+    assert tasks._infer_prefix_from_module("interfaces.ui", _TEST_MODULES) == "UI"
+    assert tasks._infer_prefix_from_module("interfaces.scheduler", _TEST_MODULES) == "SCH"
+    assert tasks._infer_prefix_from_module("interfaces.notifications", _TEST_MODULES) == "NOTI"
+    assert tasks._infer_prefix_from_module("interfaces.mcp", _TEST_MODULES) == "MCP"
 
 
 def test_infer_prefix_from_module_falls_back_to_top_level_segment():
     # "analysis.signals" has no submodule-specific mapping; falls back to "analysis" -> ANL
-    assert tasks._infer_prefix_from_module("analysis.signals") == "ANL"
-    assert tasks._infer_prefix_from_module("features.sentiment") == "FEAT"
+    assert tasks._infer_prefix_from_module("analysis.signals", _TEST_MODULES) == "ANL"
+    assert tasks._infer_prefix_from_module("features.sentiment", _TEST_MODULES) == "FEAT"
 
 
 def test_infer_prefix_from_module_unknown_raises_with_known_mappings_listed():
     with pytest.raises(ValueError) as exc:
-        tasks._infer_prefix_from_module("nonexistent")
+        tasks._infer_prefix_from_module("nonexistent", _TEST_MODULES)
     msg = str(exc.value)
     assert "nonexistent" in msg
     assert "FEAT" in msg  # known mappings are listed
 
 
+def test_infer_prefix_from_module_no_mappings_raises_without_empty_known_list():
+    with pytest.raises(ValueError) as exc:
+        tasks._infer_prefix_from_module("nonexistent")
+    msg = str(exc.value)
+    assert "nonexistent" in msg
+    assert "known mappings:" not in msg
+
+
 def test_add_infers_prefix_from_module_end_to_end(tasks_file, done_file, capsys):
     rc, out, _ = run_captured(
         capsys, tasks_file, done_file, "add",
+        "--title", "New thing", "--prio", "low", "--module", "features",
+        "--goal", "g", "--done-when", "d",
+    )
+    assert rc == 0
+    assert out.strip() == "FEAT-17"
+
+
+def test_ctask_config_found_next_to_file_override_registry(tmp_path: Path, capsys):
+    """`--file` can point anywhere; `.ctask` is looked up next to THAT
+    registry (not under a "docs/" subdir of some repo root)."""
+    weird_dir = tmp_path / "wherever"
+    weird_dir.mkdir()
+    registry = weird_dir / "my-tasks.md"
+    registry.write_text(FIXTURE, encoding="utf-8")
+    _write_ctask_config(weird_dir, _TEST_MODULES_CONFIG)
+    rc, out, _ = run_captured(
+        capsys, registry, weird_dir / "my-done.md", "add",
         "--title", "New thing", "--prio", "low", "--module", "features",
         "--goal", "g", "--done-when", "d",
     )
@@ -630,27 +686,28 @@ cross-file-references: [docs/TASKS.md]
 def sections_file(tmp_path: Path) -> Path:
     p = tmp_path / "TASKS-sections.md"
     p.write_text(SECTIONS_FIXTURE, encoding="utf-8")
+    _write_ctask_config(tmp_path, _TEST_MODULES_CONFIG)
     return p
 
 
 def test_infer_section_from_module_matches_real_headers():
-    assert tasks._infer_section_from_module("interfaces.cli") == "interfaces — cli"
-    assert tasks._infer_section_from_module("interfaces.ui") == "interfaces — ui"
-    assert tasks._infer_section_from_module("interfaces.scheduler") == "interfaces — scheduler"
-    assert tasks._infer_section_from_module("interfaces.notifications") == "interfaces — notifications"
-    assert tasks._infer_section_from_module("interfaces.mcp") == "interfaces — mcp"
-    assert tasks._infer_section_from_module("fetcher") == "fetcher"
-    assert tasks._infer_section_from_module("meta") == "meta — cross-cutting"
+    assert tasks._infer_section_from_module("interfaces.cli", _TEST_MODULES) == "interfaces — cli"
+    assert tasks._infer_section_from_module("interfaces.ui", _TEST_MODULES) == "interfaces — ui"
+    assert tasks._infer_section_from_module("interfaces.scheduler", _TEST_MODULES) == "interfaces — scheduler"
+    assert tasks._infer_section_from_module("interfaces.notifications", _TEST_MODULES) == "interfaces — notifications"
+    assert tasks._infer_section_from_module("interfaces.mcp", _TEST_MODULES) == "interfaces — mcp"
+    assert tasks._infer_section_from_module("fetcher", _TEST_MODULES) == "fetcher"
+    assert tasks._infer_section_from_module("meta", _TEST_MODULES) == "meta — cross-cutting"
 
 
 def test_infer_section_from_module_falls_back_to_top_level_segment():
-    assert tasks._infer_section_from_module("analysis.signals") == "analysis"
-    assert tasks._infer_section_from_module("fetcher.reddit") == "fetcher"
+    assert tasks._infer_section_from_module("analysis.signals", _TEST_MODULES) == "analysis"
+    assert tasks._infer_section_from_module("fetcher.reddit", _TEST_MODULES) == "fetcher"
 
 
 # --------------------------------------------------------------------------
-# per-project module config: docs/.ctask (JSON) extends/overrides the
-# builtin _MODULE_PREFIX_MAP for one repo, without polluting it globally.
+# per-project module config: `.ctask` (JSON) next to the registry is the only
+# source of a module -> (id-prefix, section) mapping — there is no builtin.
 # --------------------------------------------------------------------------
 def _write_project_config(repo_root: Path, modules: dict) -> Path:
     docs_dir = repo_root / "docs"
@@ -695,10 +752,27 @@ cross-file-references: [docs/TASKS.md]
 """
 
 
-def test_infer_prefix_from_module_repo_root_none_matches_default_behavior():
-    # explicit repo_root=None must behave identically to omitting it entirely
-    assert tasks._infer_prefix_from_module("features", None) == tasks._infer_prefix_from_module("features")
-    assert tasks._infer_section_from_module("features", None) == tasks._infer_section_from_module("features")
+def test_infer_prefix_from_module_none_and_omitted_both_mean_no_mapping():
+    # explicit modules=None must behave identically to omitting it entirely:
+    # both raise, since there is no builtin to fall back to.
+    with pytest.raises(ValueError):
+        tasks._infer_prefix_from_module("features", None)
+    with pytest.raises(ValueError):
+        tasks._infer_prefix_from_module("features")
+
+
+def test_load_project_config_missing_file_returns_empty(tmp_path: Path):
+    config = tasks._load_project_config(tmp_path / ".ctask")
+    assert config.modules == {}
+    assert config.historical_prefixes == {}
+    assert config.repo_root is None
+
+
+def test_load_project_config_none_path_returns_empty():
+    config = tasks._load_project_config(None)
+    assert config.modules == {}
+    assert config.historical_prefixes == {}
+    assert config.repo_root is None
 
 
 def test_infer_prefix_and_section_from_project_config(tmp_path: Path):
@@ -706,25 +780,29 @@ def test_infer_prefix_and_section_from_project_config(tmp_path: Path):
         "cr": {"prefix": "CR", "section": "CR wave — 2026-07-01 code review findings"},
         "fu": {"prefix": "FU", "section": "Follow-ups — deferred decisions"},
     })
-    assert tasks._infer_prefix_from_module("cr", repo_root=tmp_path) == "CR"
-    assert tasks._infer_section_from_module("cr", repo_root=tmp_path) == "CR wave — 2026-07-01 code review findings"
+    config = tasks._load_project_config(tmp_path / "docs" / ".ctask")
+    assert tasks._infer_prefix_from_module("cr", config.modules) == "CR"
+    assert tasks._infer_section_from_module("cr", config.modules) == "CR wave — 2026-07-01 code review findings"
 
 
-def test_project_config_overrides_builtin_on_key_collision(tmp_path: Path):
-    _write_project_config(tmp_path, {
-        "features": {"prefix": "ZZZZ", "section": "overridden section"},
-    })
-    assert tasks._infer_prefix_from_module("features", repo_root=tmp_path) == "ZZZZ"
-    assert tasks._infer_section_from_module("features", repo_root=tmp_path) == "overridden section"
-
-
-def test_missing_project_config_file_falls_back_to_builtin_only(tmp_path: Path):
+def test_missing_project_config_file_yields_no_mappings(tmp_path: Path):
     (tmp_path / "docs").mkdir()  # docs/ exists, but no .ctask file in it
-    assert tasks._infer_prefix_from_module("features", repo_root=tmp_path) == "FEAT"
+    config = tasks._load_project_config(tmp_path / "docs" / ".ctask")
+    assert config.modules == {}
 
 
-def test_project_config_missing_docs_dir_falls_back_to_builtin_only(tmp_path: Path):
-    assert tasks._infer_prefix_from_module("features", repo_root=tmp_path) == "FEAT"
+def test_project_config_missing_docs_dir_yields_no_mappings(tmp_path: Path):
+    config = tasks._load_project_config(tmp_path / "docs" / ".ctask")
+    assert config.modules == {}
+
+
+def test_project_config_modules_key_optional(tmp_path: Path):
+    config_path = tmp_path / "docs" / ".ctask"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"historical_prefixes": {"INT-SCH": "SCH"}}), encoding="utf-8")
+    config = tasks._load_project_config(config_path)
+    assert config.modules == {}
+    assert config.historical_prefixes == {"INT-SCH": "SCH"}
 
 
 def test_malformed_project_config_invalid_json_raises_value_error(tmp_path: Path):
@@ -732,15 +810,39 @@ def test_malformed_project_config_invalid_json_raises_value_error(tmp_path: Path
     config_path.parent.mkdir(parents=True)
     config_path.write_text("{not valid json", encoding="utf-8")
     with pytest.raises(ValueError) as exc:
-        tasks._infer_prefix_from_module("cr", repo_root=tmp_path)
+        tasks._load_project_config(config_path)
     assert str(config_path) in str(exc.value)
 
 
 def test_malformed_project_config_bad_prefix_shape_raises_value_error(tmp_path: Path):
     config_path = _write_project_config(tmp_path, {"cr": {"prefix": "lowercase", "section": "x"}})
     with pytest.raises(ValueError) as exc:
-        tasks._infer_prefix_from_module("cr", repo_root=tmp_path)
+        tasks._load_project_config(config_path)
     assert str(config_path) in str(exc.value)
+
+
+def test_malformed_historical_prefixes_bad_value_raises_value_error(tmp_path: Path):
+    config_path = tmp_path / "docs" / ".ctask"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"historical_prefixes": {"INT-SCH": "lowercase"}}), encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        tasks._load_project_config(config_path)
+    assert str(config_path) in str(exc.value)
+
+
+def test_historical_prefixes_normalize_commit_scope():
+    assert tasks._extract_id_from_scope("int-sch-13", {"INT-SCH": "SCH"}) == "SCH-13"
+    # without the config, the historical prefix is NOT normalized
+    assert tasks._extract_id_from_scope("int-sch-13", {}) == "INT-SCH-13"
+    assert tasks._extract_id_from_scope("int-sch-13") == "INT-SCH-13"
+
+
+def test_repo_root_config_key_relative_path_resolved_against_config_dir(tmp_path: Path):
+    config_path = tmp_path / "docs" / ".ctask"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"repo_root": ".."}), encoding="utf-8")
+    config = tasks._load_project_config(config_path)
+    assert config.repo_root == tmp_path.resolve()
 
 
 def test_add_end_to_end_with_project_config(tmp_path: Path, done_file, capsys):
@@ -886,14 +988,26 @@ def test_add_explicit_id_with_unmapped_module_succeeds_with_section_override(sec
 # script), so the old live-ids ∪ done-ids union silently re-issues any id
 # retired before the script existed. git history is the durable record.
 # --------------------------------------------------------------------------
-def _git_repo_with_commits(tmp_path: Path, tasks_text: str, commit_subjects: list[str]) -> tuple[Path, Path]:
+def _git_repo_with_commits(
+    tmp_path: Path, tasks_text: str, commit_subjects: list[str],
+    *, historical_prefixes: dict | None = None,
+) -> tuple[Path, Path]:
     """Build a throwaway git repo with docs/TASKS.md == tasks_text and one
     commit per subject in commit_subjects (oldest first). Returns
-    (docs_dir, proj_root)."""
+    (docs_dir, proj_root).
+
+    Writes a `docs/.ctask` with `_TEST_MODULES_CONFIG`'s module map (so
+    these module -> id-prefix/section lookups keep working without a
+    builtin), optionally extended with `historical_prefixes`.
+    """
     proj = tmp_path / "proj"
     docs_dir = proj / "docs"
     docs_dir.mkdir(parents=True)
     (docs_dir / "TASKS.md").write_text(tasks_text, encoding="utf-8")
+    config = dict(_TEST_MODULES_CONFIG)
+    if historical_prefixes:
+        config = {**config, "historical_prefixes": historical_prefixes}
+    _write_ctask_config(docs_dir, config)
     subprocess.run(["git", "init", "-q"], cwd=proj, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=proj, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=proj, check=True)
@@ -975,8 +1089,12 @@ def test_extract_id_from_scope_parses_leading_id():
     assert tasks._extract_id_from_scope("fet-38") == "FET-38"
     assert tasks._extract_id_from_scope("stor-15-ui-replica") == "STOR-15"
     assert tasks._extract_id_from_scope("back-13-sweep-harness") == "BACK-13"
-    assert tasks._extract_id_from_scope("int-sch-13-queue-stats") == "SCH-13"
-    assert tasks._extract_id_from_scope("int-sch-13") == "SCH-13"
+    # without a historical_prefixes config, no normalization happens
+    assert tasks._extract_id_from_scope("int-sch-13-queue-stats") == "INT-SCH-13"
+    assert tasks._extract_id_from_scope("int-sch-13") == "INT-SCH-13"
+    # with one configured, the old prefix normalizes onto the current one
+    assert tasks._extract_id_from_scope("int-sch-13-queue-stats", {"INT-SCH": "SCH"}) == "SCH-13"
+    assert tasks._extract_id_from_scope("int-sch-13", {"INT-SCH": "SCH"}) == "SCH-13"
 
 
 def test_extract_id_from_scope_returns_none_for_slug_only():
@@ -1017,10 +1135,12 @@ def test_add_skips_id_found_only_in_git_history_back13(tmp_path: Path, capsys) -
 
 
 def test_add_normalizes_historical_interfaces_prefix_from_git_history(tmp_path: Path, capsys) -> None:
-    """git history spells the old int-sch-13 scope; it must still block SCH-13
-    today (normalized onto the renamed prefix), landing on SCH-14."""
+    """git history spells the old int-sch-13 scope; with a configured
+    historical_prefixes normalization it must still block SCH-13 today,
+    landing on SCH-14."""
     docs_dir, _proj = _git_repo_with_commits(
         tmp_path, SCH_FIXTURE, ["wip(int-sch-13): step 4 — delete schedule group"],
+        historical_prefixes={"INT-SCH": "SCH"},
     )
     rc, out, _err = run_captured(
         capsys, docs_dir / "TASKS.md", docs_dir / "DONE.md", "add",
@@ -1029,6 +1149,52 @@ def test_add_normalizes_historical_interfaces_prefix_from_git_history(tmp_path: 
     )
     assert rc == 0
     assert out.strip() == "SCH-14"
+
+
+def test_add_without_historical_prefixes_config_does_not_normalize(tmp_path: Path, capsys) -> None:
+    """Same history as above, but with no historical_prefixes configured —
+    int-sch-13 is NOT normalized onto SCH, so SCH-13 is free to reissue."""
+    docs_dir, _proj = _git_repo_with_commits(
+        tmp_path, SCH_FIXTURE, ["wip(int-sch-13): step 4 — delete schedule group"],
+    )
+    rc, out, _err = run_captured(
+        capsys, docs_dir / "TASKS.md", docs_dir / "DONE.md", "add",
+        "--id", "SCH-13", "--module", "interfaces.scheduler", "--title", "x", "--prio", "low",
+        "--goal", "g", "--done-when", "d",
+    )
+    assert rc == 0
+    assert out.strip() == "SCH-13"
+
+
+def test_add_uses_configured_repo_root_for_git_history_scan(tmp_path: Path, capsys) -> None:
+    """The registry and its `.ctask` live outside the git repo whose history
+    must be scanned; a configured "repo_root" (relative to the `.ctask`
+    file) points at it, and the retired stor-15 scope there must still be
+    honored."""
+    git_repo = tmp_path / "elsewhere" / "realrepo"
+    git_repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=git_repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo, check=True)
+    (git_repo / "f0.txt").write_text("0", encoding="utf-8")
+    subprocess.run(["git", "add", "f0.txt"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "wip(stor-15-ui-replica): x"], cwd=git_repo, check=True)
+
+    registry_dir = tmp_path / "registry"
+    registry_dir.mkdir()
+    tasks_path = registry_dir / "TASKS.md"
+    tasks_path.write_text(STOR_FIXTURE, encoding="utf-8")
+    config = dict(_TEST_MODULES_CONFIG)
+    config["repo_root"] = "../elsewhere/realrepo"
+    _write_ctask_config(registry_dir, config)
+
+    rc, out, _err = run_captured(
+        capsys, tasks_path, registry_dir / "DONE.md", "add",
+        "--module", "storage", "--title", "New storage task", "--prio", "low",
+        "--goal", "g", "--done-when", "d",
+    )
+    assert rc == 0
+    assert out.strip() == "STOR-16"  # not STOR-15, retired in realrepo's history
 
 
 def test_add_explicit_id_refused_when_present_only_in_git_history(tmp_path: Path, capsys) -> None:
@@ -1613,11 +1779,16 @@ def test_edit_unknown_target_section_aborts(sections_file, done_file, capsys):
     assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
 
 
-def test_edit_unmapped_module_without_section_aborts(sections_file, done_file, capsys):
-    rc, _, err = run_captured(capsys, sections_file, done_file, "edit", "FET-01", "--module", "unknownmod")
-    assert rc == 1
-    assert "unknownmod" in err
-    assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
+def test_edit_unmapped_module_without_section_updates_bullet_without_moving(sections_file, done_file, capsys):
+    """An unmapped --module with no --section override is not an error for
+    `edit` (unlike `add`, which has no existing span to fall back to): the
+    module:: bullet still gets updated, the task just isn't moved."""
+    rc, _, _ = run_captured(capsys, sections_file, done_file, "edit", "FET-01", "--module", "unknownmod")
+    assert rc == 0
+    parsed = tasks.parse_tasks_file(sections_file.read_text(encoding="utf-8"))
+    fetcher_section = next(s for s in parsed.sections if s.name == "fetcher")
+    assert "FET-01" in [t.id for t in fetcher_section.tasks]
+    assert parsed.tasks_by_id()["FET-01"].module == "unknownmod"
 
 
 def test_edit_file_final_task_roundtrips_cleanly(tasks_file, done_file, capsys):
