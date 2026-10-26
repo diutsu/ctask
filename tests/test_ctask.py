@@ -2047,7 +2047,11 @@ def test_add_section_then_remove_section_round_trips_cleanly(sections_file, done
     rc, out, _ = run_captured(capsys, sections_file, done_file, "remove-section", "docs")
     assert rc == 0
     assert out.strip() == "docs"
-    assert sections_file.read_text(encoding="utf-8") == SECTIONS_FIXTURE
+    # task bytes round-trip exactly; frontmatter's updated:: is bumped by
+    # both mutating commands, so compare against SECTIONS_FIXTURE with that
+    # one line updated rather than byte-for-byte.
+    expected = SECTIONS_FIXTURE.replace("updated: 2026-01-01", f"updated: {_dt.date.today().isoformat()}")
+    assert sections_file.read_text(encoding="utf-8") == expected
 
 
 def test_remove_section_rejects_when_it_still_has_tasks(sections_file, done_file, capsys):
@@ -2197,3 +2201,146 @@ def test_cp1252_console_encoding_does_not_crash_on_em_dash(tasks_file) -> None:
     )
     assert res.returncode == 0
     assert "FEAT-15 — Improve sentiment scoring".encode("utf-8") in res.stdout
+
+# --------------------------------------------------------------------------
+# shared write guard (_guarded_render) / bump_updated / close write order
+# --------------------------------------------------------------------------
+NO_FRONTMATTER_FIXTURE = """# Tasks
+
+## features
+
+### FEAT-15 — Improve sentiment scoring
+
+- prio:: high
+- module:: features
+- created:: 2026-01-01
+
+**Goal.** Make sentiment scoring better.
+
+**Done when.** scoring is better.
+"""
+
+
+def test_close_on_registry_without_frontmatter_succeeds(tmp_path: Path, done_file, capsys):
+    p = tmp_path / "TASKS.md"
+    p.write_text(NO_FRONTMATTER_FIXTURE, encoding="utf-8")
+    rc, out, err = run_captured(capsys, p, done_file, "close", "FEAT-15")
+    assert rc == 0, err
+    assert out.splitlines()[0] == "FEAT-15"
+    text = p.read_text(encoding="utf-8")
+    assert "FEAT-15" not in tasks.parse_tasks_file(text).tasks_by_id()
+    done_text = done_file.read_text(encoding="utf-8")
+    assert "FEAT-15" in tasks.parse_tasks_file(done_text).tasks_by_id()
+
+
+def test_edit_on_registry_without_frontmatter_succeeds(tmp_path: Path, done_file, capsys):
+    p = tmp_path / "TASKS.md"
+    p.write_text(NO_FRONTMATTER_FIXTURE, encoding="utf-8")
+    rc, out, err = run_captured(capsys, p, done_file, "edit", "FEAT-15", "--prio", "low")
+    assert rc == 0, err
+    t = tasks.parse_tasks_file(p.read_text(encoding="utf-8")).tasks_by_id()["FEAT-15"]
+    assert t.prio == "low"
+
+
+def test_close_writes_done_md_before_tasks_md(tasks_file, done_file, capsys, monkeypatch):
+    write_order = []
+    real_atomic_write = tasks._atomic_write
+
+    def recording_write(path, text):
+        write_order.append(Path(path).name)
+        real_atomic_write(path, text)
+
+    monkeypatch.setattr(tasks, "_atomic_write", recording_write)
+    rc = run(tasks_file, done_file, "close", "FEAT-15")
+    assert rc == 0
+    assert write_order == ["DONE.md", "TASKS.md"]
+
+
+def test_close_crash_after_done_write_leaves_task_recoverable_in_done_md(tasks_file, done_file, capsys, monkeypatch):
+    """If the process dies between the two writes, done.md (written first)
+    must already have the task — nothing is lost, even though tasks.md still
+    also has it (a duplicate `validate` flags, not a silent loss)."""
+    real_atomic_write = tasks._atomic_write
+    calls = []
+
+    def flaky_write(path, text):
+        calls.append(Path(path).name)
+        if Path(path).name == "TASKS.md":
+            raise OSError("simulated crash before the second write")
+        real_atomic_write(path, text)
+
+    monkeypatch.setattr(tasks, "_atomic_write", flaky_write)
+    with pytest.raises(OSError):
+        run(tasks_file, done_file, "close", "FEAT-15")
+    assert calls == ["DONE.md", "TASKS.md"]
+    # done.md already has the task, despite the crash on the second write
+    done_text = done_file.read_text(encoding="utf-8")
+    assert "FEAT-15" in tasks.parse_tasks_file(done_text).tasks_by_id()
+
+
+def test_guarded_render_refuses_when_an_untouched_task_would_change(capsys):
+    # before_raws deliberately claims a byte sequence FEAT-15 never actually
+    # had — simulating "an untouched task's raw would be altered by this write".
+    before_raws = {"FEAT-15": "ORIGINAL RAW THAT NEVER EXISTED\n"}
+    new_text = tasks.parse_tasks_file(FIXTURE).render()
+    result = tasks._guarded_render("test", new_text, before_raws, set())
+    assert result is None
+    err = capsys.readouterr().err
+    assert "test: refusing to write" in err
+    assert "FEAT-15" in err
+
+
+def test_guarded_render_refuses_when_required_id_missing(capsys):
+    text = tasks.parse_tasks_file(FIXTURE).render()
+    result = tasks._guarded_render("test", text, {}, set(), required_ids={"FEAT-99"})
+    assert result is None
+    err = capsys.readouterr().err
+    assert "FEAT-99" in err
+    assert "test: refusing to write" in err
+
+
+def test_add_refuses_to_write_when_guard_fails(tasks_file, done_file, capsys, monkeypatch):
+    monkeypatch.setattr(tasks, "_guarded_render", lambda *a, **k: None)
+    rc, out, err = run_captured(
+        capsys, tasks_file, done_file, "add",
+        "--id", "FEAT-99", "--title", "New thing", "--prio", "low", "--module", "features",
+    )
+    assert rc == 1
+    assert tasks_file.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_close_refuses_to_write_when_guard_fails(tasks_file, done_file, capsys, monkeypatch):
+    monkeypatch.setattr(tasks, "_guarded_render", lambda *a, **k: None)
+    rc, out, err = run_captured(capsys, tasks_file, done_file, "close", "FEAT-15")
+    assert rc == 1
+    assert tasks_file.read_text(encoding="utf-8") == FIXTURE
+    assert not done_file.exists()
+
+
+def test_add_bumps_updated(tasks_file, done_file, capsys):
+    rc, out, _ = run_captured(
+        capsys, tasks_file, done_file, "add",
+        "--id", "FEAT-99", "--title", "New thing", "--prio", "low", "--module", "features",
+    )
+    assert rc == 0
+    text = tasks_file.read_text(encoding="utf-8")
+    assert "updated: 2026-01-01" not in text
+    assert f"updated: {_dt.date.today().isoformat()}" in text
+    assert "created: 2026-01-01" in text
+
+
+def test_add_section_bumps_updated(sections_file, done_file, capsys):
+    rc, out, _ = run_captured(capsys, sections_file, done_file, "add-section", "docs", "--after", "fetcher")
+    assert rc == 0
+    text = sections_file.read_text(encoding="utf-8")
+    assert "updated: 2026-01-01" not in text
+    assert f"updated: {_dt.date.today().isoformat()}" in text
+
+
+def test_remove_section_bumps_updated(sections_file, done_file, capsys):
+    run_captured(capsys, sections_file, done_file, "add-section", "docs", "--after", "fetcher")
+    rc, out, _ = run_captured(capsys, sections_file, done_file, "remove-section", "docs")
+    assert rc == 0
+    text = sections_file.read_text(encoding="utf-8")
+    assert "updated: 2026-01-01" not in text
+    assert f"updated: {_dt.date.today().isoformat()}" in text

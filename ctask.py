@@ -342,6 +342,12 @@ def parse_tasks_file(text: str) -> ParsedFile:
 # Frontmatter helpers
 # --------------------------------------------------------------------------
 def _bump_updated(frontmatter_raw: str, today: str) -> str:
+    """Bump `updated:` to `today`. A no-op (returns `frontmatter_raw` unchanged)
+    when there is no frontmatter at all, or it has no `updated:` field — a
+    registry without that shape is a pre-existing, legitimate state (not every
+    registry has frontmatter), not a reason for `close`/`edit` to crash."""
+    if not frontmatter_raw:
+        return frontmatter_raw
     out_lines = []
     bumped = False
     for ln in frontmatter_raw.splitlines(keepends=True):
@@ -351,7 +357,7 @@ def _bump_updated(frontmatter_raw: str, today: str) -> str:
         else:
             out_lines.append(ln)
     if not bumped:
-        raise TasksParseError("frontmatter has no 'updated:' field to bump")
+        return frontmatter_raw
     return "".join(out_lines)
 
 
@@ -658,6 +664,50 @@ def _load(path: Path) -> tuple[str, ParsedFile]:
     text = path.read_text(encoding="utf-8")
     parsed = parse_tasks_file(text)
     return text, parsed
+
+
+# --------------------------------------------------------------------------
+# Shared write guard — every mutating command's final checkpoint before
+# `_atomic_write`. Round-trip safety is the one property every command must
+# share equally: the already-rendered `new_text` must (1) re-parse, (2)
+# render back out to exactly `new_text` (a true round-trip, not just "parses
+# without error"), (3) leave every task in `before_raws` NOT in `exempt_ids`
+# byte-identical, and (4), when `required_ids` is given, actually contain
+# each of those ids (used by callers — `add`, `close` — that are adding or
+# moving a task into the file, to catch it silently vanishing). Any failure
+# prints a "{cmd}: refusing to write — ..." message and returns None; the
+# caller must then write nothing.
+# --------------------------------------------------------------------------
+def _guarded_render(
+    cmd: str,
+    new_text: str,
+    before_raws: dict[str, str],
+    exempt_ids: set[str],
+    *,
+    noun: str = "file",
+    required_ids: set[str] | None = None,
+) -> str | None:
+    try:
+        reparsed = parse_tasks_file(new_text)
+    except TasksParseError as e:
+        print(f"{cmd}: refusing to write — {noun} no longer parses: {e}", file=sys.stderr)
+        return None
+    if reparsed.render() != new_text:
+        print(f"{cmd}: refusing to write — {noun} does not round-trip", file=sys.stderr)
+        return None
+    re_raws = {t.id: t.raw for t in reparsed.all_tasks()}
+    for tid, raw in before_raws.items():
+        if tid in exempt_ids:
+            continue
+        if re_raws.get(tid) != raw:
+            print(f"{cmd}: refusing to write — would alter untouched task {tid}", file=sys.stderr)
+            return None
+    if required_ids:
+        for rid in required_ids:
+            if rid not in re_raws:
+                print(f"{cmd}: refusing to write — {rid} missing from rendered file", file=sys.stderr)
+                return None
+    return new_text
 
 
 # --------------------------------------------------------------------------
@@ -1074,9 +1124,14 @@ def cmd_add(
         )
         return 1
 
+    before_raws = {t.id: t.raw for t in parsed.all_tasks()}
     section.tasks.append(new_task)
+    parsed.frontmatter_raw = _bump_updated(parsed.frontmatter_raw, today)
 
-    new_text = parsed.render()
+    new_text = _guarded_render("add", parsed.render(), before_raws, {task_id}, required_ids={task_id})
+    if new_text is None:
+        return 1
+
     _atomic_write(tasks_path, new_text)
     print(task_id)
     return 0
@@ -1103,21 +1158,12 @@ def cmd_add_section(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Pa
 
     new_section = Section(header_raw=f"## {name}\n", name=name, preamble_raw="\n", tasks=[])
     parsed.sections.insert(after_idx + 1, new_section)
+    today = _dt.date.today().isoformat()
+    parsed.frontmatter_raw = _bump_updated(parsed.frontmatter_raw, today)
 
-    new_text = parsed.render()
-    try:
-        reparsed = parse_tasks_file(new_text)
-    except TasksParseError as e:
-        print(f"add-section: refusing to write — file no longer parses: {e}", file=sys.stderr)
+    new_text = _guarded_render("add-section", parsed.render(), other_raws, set())
+    if new_text is None:
         return 1
-    if reparsed.render() != new_text:
-        print("add-section: refusing to write — file does not round-trip", file=sys.stderr)
-        return 1
-    re_raws = {t.id: t.raw for t in reparsed.all_tasks()}
-    for tid, raw in other_raws.items():
-        if re_raws.get(tid) != raw:
-            print(f"add-section: refusing to write — would alter untouched task {tid}", file=sys.stderr)
-            return 1
 
     _atomic_write(tasks_path, new_text)
     print(name)
@@ -1152,6 +1198,9 @@ def cmd_remove_section(parsed: ParsedFile, args: argparse.Namespace, tasks_path:
     if idx > 0 and parsed.sections[idx - 1].tasks:
         trimmed_task_id = parsed.sections[idx - 1].tasks[-1].id
 
+    today = _dt.date.today().isoformat()
+    parsed.frontmatter_raw = _bump_updated(parsed.frontmatter_raw, today)
+
     before_text = parsed.frontmatter_raw + parsed.preamble_raw + "".join(s.render() for s in parsed.sections[:idx])
     after_text = "".join(s.render() for s in parsed.sections[idx + 1:])
 
@@ -1169,21 +1218,10 @@ def cmd_remove_section(parsed: ParsedFile, args: argparse.Namespace, tasks_path:
 
     new_text = before_text + after_text
 
-    try:
-        reparsed = parse_tasks_file(new_text)
-    except TasksParseError as e:
-        print(f"remove-section: refusing to write — file no longer parses: {e}", file=sys.stderr)
+    exempt_ids = {trimmed_task_id} if collapsed and trimmed_task_id else set()
+    new_text = _guarded_render("remove-section", new_text, other_raws, exempt_ids)
+    if new_text is None:
         return 1
-    if reparsed.render() != new_text:
-        print("remove-section: refusing to write — file does not round-trip", file=sys.stderr)
-        return 1
-    re_raws = {t.id: t.raw for t in reparsed.all_tasks()}
-    for tid, raw in other_raws.items():
-        if collapsed and tid == trimmed_task_id:
-            continue
-        if re_raws.get(tid) != raw:
-            print(f"remove-section: refusing to write — would alter untouched task {tid}", file=sys.stderr)
-            return 1
 
     parsed.sections = parsed.sections[:idx] + parsed.sections[idx + 1:]
     _atomic_write(tasks_path, new_text)
@@ -1329,20 +1367,9 @@ def cmd_edit(parsed: ParsedFile, args: argparse.Namespace, tasks_path: Path, rep
 
     # final whole-file guard: must re-parse, must round-trip, and every OTHER
     # task's bytes must be exactly what they were — else write nothing
-    new_text = parsed.render()
-    try:
-        reparsed = parse_tasks_file(new_text)
-    except TasksParseError as e:
-        print(f"edit: refusing to write — edited file no longer parses: {e}", file=sys.stderr)
+    new_text = _guarded_render("edit", parsed.render(), other_raws, set(), noun="edited file")
+    if new_text is None:
         return 1
-    if reparsed.render() != new_text:
-        print("edit: refusing to write — edited file does not round-trip", file=sys.stderr)
-        return 1
-    re_raws = {task.id: task.raw for task in reparsed.all_tasks()}
-    for tid, raw in other_raws.items():
-        if re_raws.get(tid) != raw:
-            print(f"edit: refusing to write — would alter untouched task {tid}", file=sys.stderr)
-            return 1
 
     _atomic_write(tasks_path, new_text)
     print(t.id)
@@ -1437,22 +1464,9 @@ def cmd_renumber(
     # final whole-file guard: must re-parse, must round-trip, and every task
     # NOT touched by this operation must have byte-identical raw — else
     # write nothing
-    new_text = parsed.render()
-    try:
-        reparsed = parse_tasks_file(new_text)
-    except TasksParseError as e:
-        print(f"renumber: refusing to write — edited file no longer parses: {e}", file=sys.stderr)
+    new_text = _guarded_render("renumber", parsed.render(), other_raws, touched_other_ids, noun="edited file")
+    if new_text is None:
         return 1
-    if reparsed.render() != new_text:
-        print("renumber: refusing to write — edited file does not round-trip", file=sys.stderr)
-        return 1
-    re_raws = {task.id: task.raw for task in reparsed.all_tasks()}
-    for tid, raw in other_raws.items():
-        if tid in touched_other_ids:
-            continue
-        if re_raws.get(tid) != raw:
-            print(f"renumber: refusing to write — would alter untouched task {tid}", file=sys.stderr)
-            return 1
 
     _atomic_write(tasks_path, new_text)
     print(f"{old_id} -> {new_id}")
@@ -1472,6 +1486,8 @@ def cmd_close(
         print(f"unknown id: {args.id}", file=sys.stderr)
         return 1
 
+    before_raws_tasks = {tid: task.raw for tid, task in by_id.items() if tid != t.id}
+
     for s in parsed.sections:
         if t in s.tasks:
             s.tasks.remove(t)
@@ -1486,16 +1502,30 @@ def cmd_close(
     if done_section is None:
         done_section = Section(header_raw=f"## {t.section}\n", name=t.section, preamble_raw="\n", tasks=[])
         parsed_done.sections.append(done_section)
+
+    before_raws_done = {d.id: d.raw for d in parsed_done.all_tasks()}
     done_section.tasks.append(moved_task)
 
     parsed.frontmatter_raw = _bump_updated(parsed.frontmatter_raw, today)
     parsed_done.frontmatter_raw = _bump_updated(parsed_done.frontmatter_raw, today)
 
-    new_tasks_text = parsed.render()
-    new_done_text = parsed_done.render()
+    # Both guards are checked, and both texts fully rendered, BEFORE either
+    # write happens — a guard failure on either file must write nothing.
+    new_done_text = _guarded_render(
+        "close", parsed_done.render(), before_raws_done, set(),
+        noun="done.md", required_ids={moved_task.id},
+    )
+    if new_done_text is None:
+        return 1
+    new_tasks_text = _guarded_render("close", parsed.render(), before_raws_tasks, set(), noun="tasks.md")
+    if new_tasks_text is None:
+        return 1
 
-    _atomic_write(tasks_path, new_tasks_text)
+    # Write done.md FIRST: if the process dies between the two writes, the
+    # task ends up duplicated in both files — caught loudly by `validate`'s
+    # "also present in DONE.md" check — rather than silently lost from both.
     _atomic_write(done_path, new_done_text)
+    _atomic_write(tasks_path, new_tasks_text)
 
     print(t.id)
     for other in parsed.all_tasks():
